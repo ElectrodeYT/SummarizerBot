@@ -1,3 +1,4 @@
+import io
 import tempfile
 import os
 from datetime import datetime
@@ -44,13 +45,21 @@ def format_message_list(messages: [discord.Message]):
     return formatted_messages
 
 async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: discord.Embed):
+    model = 'deepseek-r1-distill-llama-70b'
+    temperature = 0.7
+    max_tokens = 4096
+
     completion = await ai_client.chat.completions.create(
-        model='deepseek-r1-distill-llama-70b',
+        model=model,
         messages=llm_messages,
-        temperature=0.7,
-        max_tokens=4096,
+        temperature=temperature,
+        max_tokens=max_tokens,
         stream=True
     )
+
+    # Add llm info to the embed
+    embed.add_field(name='LLM Info', value=f'Model: {model}, Max Tokens: {max_tokens}, '
+                                           f'Temperature: {temperature}')
 
     # Don't edit too much
     last_edit = None
@@ -77,9 +86,8 @@ async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: dis
     embed.title = 'Summary'
 
     if len(summary) >= 4096:
-        with tempfile.NamedTemporaryFile() as tmpfile:
-            tmpfile.write(summary.encode('utf-8'))
-            await interaction.edit_original_response(embed=embed, file=discord.File(filename=tmpfile.name))
+        f = io.StringIO(summary)
+        await interaction.edit_original_response(embed=embed, file=discord.File(fp=f, filename='generated.txt'))
     else:
         await interaction.edit_original_response(embed=embed)
 
