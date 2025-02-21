@@ -26,6 +26,7 @@ db_con = sqlite3.connect('data/cache.db')
 db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
+db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT PRIMARY KEY, embedding TEXT)')
 db_con.commit()
 
 class DiscordClient(discord.Client):
@@ -353,6 +354,7 @@ async def summarize(interaction: discord.Interaction, count_msgs: int = None, ch
         await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
 
 
 @client.tree.command(description='Summarize for topic')
@@ -375,6 +377,7 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
         await create_topic_summary(interaction, discord_messages, topic, footer_text)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
 
 def main() -> None:
     client.run(discord_token)
