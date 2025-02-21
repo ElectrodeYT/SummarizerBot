@@ -169,6 +169,7 @@ async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Me
                                                   after=next_message_id)
             cached_messages.append(cached_message)
             before = cached_message
+            limit -= 1
         else:
             # We have reached our limit
             break
@@ -334,62 +335,44 @@ async def create_topic_summary(interaction: discord.Interaction, discord_message
 @client.tree.command()
 async def summarize(interaction: discord.Interaction, count_msgs: int = None, channel: discord.TextChannel = None,
                     summarize_prompt: str = default_summary_prompt) -> None:
-    if channel is None:
-        channel = interaction.channel
+    await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
-    await interaction.response.send_message('Doing stuff, might take a (long) while... (compiling messages)')
+    try:
+        if channel is None:
+            channel = interaction.channel
 
-    # Get the messages, then invert the array
-    discord_messages = await get_messages(channel=channel, limit=count_msgs)
-    footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}'
+        await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (compiling messages)')
 
-    await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-    await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
+        # Get the messages, then invert the array
+        discord_messages = await get_messages(channel=channel, limit=count_msgs)
+        footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}'
 
-@client.tree.context_menu(name='Summarize after this message')
-async def summarize_after(interaction: discord.Interaction, message: discord.Message) -> None:
-    channel = message.channel
-    summarize_prompt = default_summary_prompt
+        await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
+        await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
 
-    await interaction.response.send_message('Doing stuff, might take a (long) while... (compiling messages)', ephemeral=True)
-
-    # TODO: cache after
-    discord_messages = [message async for message in channel.history(after=message, oldest_first=True, limit=None)]
-    footer_text = (f'Summary of {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}\n'
-                   f'After: [This message]({str(message.jump_url)})')
-
-    await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-    await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
-
-@client.tree.context_menu(name='Summarize around this message')
-async def summarize_around(interaction: discord.Interaction, message: discord.Message) -> None:
-    channel = message.channel
-    summarize_prompt = default_summary_prompt
-
-    await interaction.response.send_message('Doing stuff, might take a (long) while... (compiling messages)', ephemeral=True)
-
-    # TODO: support around
-    discord_messages = [message async for message in channel.history(around=message, oldest_first=True, limit=101)]
-    footer_text = f'Summary of {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}\n'
-
-    await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-    await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
 
 @client.tree.command(description='Summarize for topic')
 async def summarize_topic(interaction: discord.Interaction, topic: str, count_msgs: int = None,
                           channel: discord.TextChannel = None) -> None:
-    if channel is None:
-        channel = interaction.channel
+    await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
-    await interaction.response.send_message('Doing stuff, might take a (long) while... (compiling messages)')
+    try:
+        if channel is None:
+            channel = interaction.channel
 
-    # Get the messages, then invert the array
-    discord_messages = await get_messages(channel=channel, limit=count_msgs)
+        await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (compiling messages)')
 
-    footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Topic: {topic}'
+        # Get the messages, then invert the array
+        discord_messages = await get_messages(channel=channel, limit=count_msgs)
 
-    await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-    await create_topic_summary(interaction, discord_messages, topic, footer_text)
+        footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Topic: {topic}'
+
+        await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
+        await create_topic_summary(interaction, discord_messages, topic, footer_text)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
 
 def main() -> None:
     client.run(discord_token)
