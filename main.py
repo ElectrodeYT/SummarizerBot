@@ -20,7 +20,9 @@ ai_client = AsyncOpenAI(
     api_key=scaleway_token
 )
 
-db_con = sqlite3.connect('cache.db')
+os.makedirs('data', exist_ok=True)
+
+db_con = sqlite3.connect('data/cache.db')
 db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
