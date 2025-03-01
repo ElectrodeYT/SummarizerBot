@@ -96,9 +96,8 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
         raise
 
 
-@client.tree.context_menu(name='UwU-ify message :3')
-async def uwuify(interaction: discord.Interaction, message: discord.Message):
-    await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=True)
+async def uwuify_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
+    await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)
 
     model = 'deepseek-r1-distill-llama-70b'
     temperature = 0.6
@@ -131,6 +130,16 @@ async def uwuify(interaction: discord.Interaction, message: discord.Message):
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
+
+
+@client.tree.context_menu(name='UwU-ify message :3')
+async def uwuify(interaction: discord.Interaction, message: discord.Message):
+    await uwuify_impl(interaction=interaction, message=message, ephemeral=False)
+
+
+@client.tree.context_menu(name='UwU-ify message (Keep Private)')
+async def uwuify_ephemeral(interaction: discord.Interaction, message: discord.Message):
+    await uwuify_impl(interaction=interaction, message=message, ephemeral=True)
 
 
 def main() -> None:
