@@ -1,4 +1,5 @@
 import os
+from openai import AsyncOpenAI
 from pprint import pprint
 
 import discord
@@ -8,6 +9,13 @@ import summary_llm
 
 discord_token = os.environ['DISCORD_TOKEN']
 default_summary_prompt = 'Summarize the conversation(s). If there are several conversations, summarize them individually.'
+
+scaleway_token = os.environ['SCW_TOKEN']
+
+ai_client = AsyncOpenAI(
+    base_url="https://api.scaleway.ai/v1",
+    api_key=scaleway_token
+)
 
 
 class DiscordClient(discord.Client):
@@ -83,6 +91,43 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
         await summary_llm.create_topic_summary(interaction, discord_messages, topic, footer_text)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
+@client.tree.context_menu(name='UwU-ify message :3')
+async def uwuify(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=True)
+
+    model = 'deepseek-r1-distill-llama-70b'
+    temperature = 0.6
+    top_p = 0.95
+    max_tokens = 4096
+    presence_penalty = 0
+
+    messages = [{'role': 'system', 'content': 'UwU-ify every user message, and echo it, without saying'
+                                              ' anything else.'},
+                {'role': 'user', 'content': f'{message.content}'}]
+
+    pprint(messages)
+
+    try:
+        completion = await ai_client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=messages,
+            top_p=top_p,
+            presence_penalty=presence_penalty
+        )
+
+        embed = discord.Embed(description=completion.choices[0].message.content)
+        embed.add_field(name='LLM Info', value=f'Model: {model}, Max Tokens: {max_tokens}, '
+                                               f'Temperature: {temperature}')
+        embed.set_footer(text=f'Original message by {message.author}')
+
+        await interaction.edit_original_response(content='', embed=embed)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
