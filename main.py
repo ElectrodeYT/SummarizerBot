@@ -1,3 +1,5 @@
+import ast
+import hashlib
 import io
 import os
 import sqlite3
@@ -36,11 +38,23 @@ class DiscordClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.setup_guilds = []
 
-    async def on_guild_available(self, guild: discord.Guild):
+    async def setup_guild_stuff(self, guild: discord.Guild):
+        if guild.id in self.setup_guilds:
+            return
+
         print(f"Setting up hook for {guild.name} (ID: {guild.id})")
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+
+        self.setup_guilds.append(guild.id)
+
+    async def on_guild_available(self, guild: discord.Guild):
+        await self.setup_guild_stuff(guild)
+
+    async def on_guild_join(self, guild: discord.Guild):
+        await self.setup_guild_stuff(guild)
 
 class CachedDiscordAuthor(discord.Object):
     name: str
@@ -182,6 +196,21 @@ async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Me
 
     return cached_messages
 
+async def fetch_embedding_from_cache(message: CachedDiscordMessage | discord.Message):
+    hash = hashlib.sha1(message.content.encode('utf-8')).hexdigest()
+
+    cur = db_con.cursor()
+    cur.execute('SELECT embedding FROM embeddings WHERE hash = ?', (hash,))
+    embedding_str = cur.fetchone()
+    cur.close()
+
+    if embedding_str is None:
+        return None
+
+    embedding = ast.literal_eval(embedding_str)
+    assert embedding is list[float]
+
+    return embedding
 
 async def get_messages(channel: discord.TextChannel, limit = 50, before = None, after = None):
     messages = []
