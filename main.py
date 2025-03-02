@@ -100,14 +100,14 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
 async def uwuify_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
     await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)
 
-    model = 'deepseek-r1-distill-llama-70b'
-    temperature = 0.6
-    top_p = 0.95
+    model = 'llama-3.3-70b-instruct'
+    temperature = 1.26
+    top_p = 0.81
     max_tokens = 4096
     presence_penalty = 0
 
-    messages = [{'role': 'system', 'content': 'UwU-ify every user message, and echo it, without saying'
-                                              ' anything else.'},
+    messages = [{'role': 'system', 'content': 'UwU-ify the users message, and echo it, without saying anything else. '
+                                              'Use emoticons too.'},
                 {'role': 'user', 'content': f'{message.content}'}]
 
     pprint(messages)
