@@ -21,6 +21,7 @@ ai_client = AsyncOpenAI(
 class DiscordClient(discord.Client):
     async def on_ready(self):
         print(f"Logged in as {self.user.name} (ID: {self.user.id})")
+        await self.tree.sync()
 
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -133,11 +134,15 @@ async def uwuify_impl(interaction: discord.Interaction, message: discord.Message
 
 
 @client.tree.context_menu(name='UwU-ify message :3')
+@app_commands.allowed_installs(guilds=False, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def uwuify(interaction: discord.Interaction, message: discord.Message):
     await uwuify_impl(interaction=interaction, message=message, ephemeral=False)
 
 
 @client.tree.context_menu(name='UwU-ify message (Keep Private)')
+@app_commands.allowed_installs(guilds=False, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def uwuify_ephemeral(interaction: discord.Interaction, message: discord.Message):
     await uwuify_impl(interaction=interaction, message=message, ephemeral=True)
 
