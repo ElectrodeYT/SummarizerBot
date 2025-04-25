@@ -147,6 +147,56 @@ async def uwuify_ephemeral(interaction: discord.Interaction, message: discord.Me
     await uwuify_impl(interaction=interaction, message=message, ephemeral=True)
 
 
+async def zoomer_translator_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
+    await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)
+
+    model = 'deepseek-r1-distill-llama-70b'
+    temperature = 0.70
+    top_p = 0.95
+    max_tokens = 4096
+    presence_penalty = 0
+
+    messages = [{'role': 'system', 'content': 'You are given messages that use many acronyms, phrases, and words '
+                                              'associated with \"zoomers\" and zoomer culture. You should translate '
+                                              'the messages into more conventional language and grammar, and then '
+                                              'say the translated message, and nothing else.'},
+                {'role': 'user', 'content': f'{message.content}'}]
+
+    pprint(messages)
+
+    try:
+        completion = await ai_client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=messages,
+            top_p=top_p,
+            presence_penalty=presence_penalty
+        )
+
+        embed = discord.Embed(description=completion.choices[0].message.content)
+        embed.add_field(name='LLM Info', value=f'Model: {model}, Max Tokens: {max_tokens}, '
+                                               f'Temperature: {temperature}')
+        embed.set_footer(text=f'Original message by {message.author}')
+
+        await interaction.edit_original_response(content='', embed=embed)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+@client.tree.context_menu(name='Zoomer Translator')
+@app_commands.allowed_installs(guilds=False, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def zoomer_translator(interaction: discord.Interaction, message: discord.Message):
+    await zoomer_translator_impl(interaction=interaction, message=message, ephemeral=False)
+
+@client.tree.context_menu(name='Zoomer Translator (Keep Private)')
+@app_commands.allowed_installs(guilds=False, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def zoomer_translator_ephemeral(interaction: discord.Interaction, message: discord.Message):
+    await zoomer_translator_impl(interaction=interaction, message=message, ephemeral=True)
+
+
 def main() -> None:
     client.run(discord_token)
 
