@@ -2,6 +2,7 @@ import discord
 import os
 from datetime import datetime
 import cache
+import io
 
 from openai import AsyncOpenAI
 from pprint import pprint
@@ -22,7 +23,7 @@ def format_message_list(messages: [discord.Message]):
     for discord_message in messages:
         formatted_messages.append(f'{discord_message.author.name}: {discord_message.content}')
 
-    pprint(formatted_messages)
+    # pprint(formatted_messages)
 
     return formatted_messages
 
@@ -49,6 +50,9 @@ def discord_messages_to_cached_messages(discord_messages: [discord.Message]):
 
     return messages
 
+async def get_messages_from_discord(channel: discord.TextChannel, limit=50, before=None, after=None):
+    print(f'Fetching {limit} messages from discord directly (limit={limit}, before={before}, after={after})')
+    return [message async for message in channel.history(limit=limit, before=before, after=after)]
 
 async def get_messages(channel: discord.TextChannel, limit=50, before=None, after=None):
     messages = []
@@ -61,7 +65,7 @@ async def get_messages(channel: discord.TextChannel, limit=50, before=None, afte
         # Therefore, request the first batch of messages
         # Whenever calling to discord API, we max the limit to 50, as that is the maximum the discord API itself supports
         if before is None and after is None:
-            discord_messages = [message async for message in channel.history(limit=min(limit, 50))]
+            discord_messages = await get_messages_from_discord(channel, limit=min(limit, 50))
             before = discord_messages[-1]
         elif before is not None:
             # Check to see if we have a cache hit, and if we do, pull as many messages from there as we can (up to limit)
@@ -73,8 +77,7 @@ async def get_messages(channel: discord.TextChannel, limit=50, before=None, afte
                 continue
             else:
                 # Messages not in cache, fetch them from discord
-                discord_messages = [message async for message in channel.history(limit=min(limit, 50),
-                                                                                 before=before)]
+                discord_messages = await get_messages_from_discord(channel, limit, before=before)
                 before = discord_messages[-1]
 
         # If we got here, we need to convert the discord messages to cached messages
@@ -91,9 +94,9 @@ async def get_messages(channel: discord.TextChannel, limit=50, before=None, afte
 
 
 async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: discord.Embed):
-    model = 'deepseek-r1-distill-llama-70b'
+    model = 'gpt-oss-120b'
     temperature = 0.7
-    max_tokens = 4096
+    max_tokens = 8192
 
     completion = await ai_client.chat.completions.create(
         model=model,
@@ -115,7 +118,9 @@ async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: dis
         if len(chunk.choices) == 0:
             break
 
-        summary += chunk.choices[0].delta.content
+        delta_content = chunk.choices[0].delta.content
+        if delta_content is not None:
+            summary += delta_content
 
         if len(summary) > 4096:
             embed.description = (f'Response is getting too long, please wait for it to be done...\n'
@@ -131,7 +136,7 @@ async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: dis
 
     if len(summary) >= 4096:
         f = io.StringIO(summary)
-        await interaction.edit_original_response(embed=embed, file=discord.File(fp=f, filename='generated.txt'))
+        await interaction.edit_original_response(embed=embed, attachments=[discord.File(fp=f, filename='^generated.txt')])
     else:
         await interaction.edit_original_response(embed=embed)
 

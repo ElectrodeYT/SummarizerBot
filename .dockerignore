@@ -2,3 +2,4 @@ data/
 .git
 .github
 *venv*
+.env
