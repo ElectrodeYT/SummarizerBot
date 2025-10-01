@@ -4,13 +4,34 @@ import sqlite3
 import discord
 import os
 
+from pprint import pprint
+
 os.makedirs('data', exist_ok=True)
 
 db_con = sqlite3.connect('data/cache.db')
+# Improve concurrency and read performance
+try:
+    db_con.execute('PRAGMA journal_mode = WAL')
+    db_con.execute('PRAGMA synchronous = NORMAL')
+    db_con.execute('PRAGMA temp_store = MEMORY')
+except Exception:
+    pass
+
 db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding TEXT, model TEXT, UNIQUE(hash, model))')
+
+# Create helpful indices for faster lookups
+try:
+    db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_next ON messages(next_message_id)')
+    db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_prev ON messages(previous_message_id)')
+    db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id)')
+    db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_channel_next ON messages(channel_id, next_message_id)')
+    db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_channel_prev ON messages(channel_id, previous_message_id)')
+except Exception:
+    pass
+
 db_con.commit()
 
 
@@ -43,6 +64,9 @@ class CachedDiscordMessage(discord.Object):
     @property
     def type(self):
         return 'cached'
+
+    def __repr__(self):
+        return super().__repr__() + f' (author={self.author.name if self.author else None}, content="{self.content[:30]}...")'
 
 
 # For this, we expect the messages to be in oldest -> newest order.
@@ -99,43 +123,54 @@ async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Me
     cur = db_con.cursor()
     cached_messages = []
 
-    assert before is not None
-    while limit > 0:
-        # Check if we can get the message
-        cur.execute('SELECT id, content, author_id, channel_id, previous_message_id, next_message_id'
-                    ' FROM messages WHERE next_message_id = ?', (before.id,))
-        result = cur.fetchone()
+    if before is None:
+        return cached_messages
 
-        if result is not None:
-            # We have a cached result, add it to the cached messages list
-            # Try to get the author
-            message_id, content, author_id, channel_id, previous_message_id, next_message_id = result
-            author = await fetch_author_from_cache(author_id)
-            if author is None:
-                # We can't fetch the author, break
-                break
+    # Use a recursive CTE to fetch up to `limit` messages that precede `before.id` by following next_message_id links.
+    cte_sql = '''
+    WITH RECURSIVE chain(depth, id, content, author_id, channel_id, previous_message_id, next_message_id) AS (
+      SELECT 0, id, content, author_id, channel_id, previous_message_id, next_message_id
+      FROM messages WHERE next_message_id = ?
+      UNION ALL
+      SELECT chain.depth+1, m.id, m.content, m.author_id, m.channel_id, m.previous_message_id, m.next_message_id
+      FROM messages m JOIN chain ON m.next_message_id = chain.id
+    )
+    SELECT id, content, author_id, channel_id, previous_message_id, next_message_id
+    FROM chain
+    ORDER BY depth ASC
+    LIMIT ?;
+    '''
 
-            cached_message = CachedDiscordMessage(id=message_id, content=content, author=author,
-                                                  channel_id=channel_id, before=previous_message_id,
-                                                  after=next_message_id)
-            cached_messages.append(cached_message)
-            before = cached_message
-            limit -= 1
-        else:
-            # We have reached our limit
+    try:
+        cur.execute(cte_sql, (before.id, limit))
+        rows = cur.fetchall()
+    except Exception:
+        cur.close()
+        return []
+
+    for idx, row in enumerate(rows):
+        message_id, content, author_id, channel_id, previous_message_id, next_message_id = row
+        author = await fetch_author_from_cache(author_id)
+        if author is None:
+            # stop if author missing
             break
 
-        if progress_callback is not None and limit % 200 == 0:
-            try:
-                await progress_callback(len(cached_messages), len(cached_messages) + limit, "Fetched from cache")
-            except Exception:
-                # don't let progress failures stop fetching
-                pass
+        cached_message = CachedDiscordMessage(id=message_id, content=content, author=author,
+                                              channel_id=channel_id, before=previous_message_id,
+                                              after=next_message_id)
+        cached_messages.append(cached_message)
 
+        # Periodic progress callback
+        if progress_callback is not None and (idx + 1) % 50 == 0:
+            try:
+                await progress_callback(len(cached_messages), len(rows), "Fetched from cache")
+            except Exception:
+                pass
 
     if len(cached_messages):
         print(f'Fetched {len(cached_messages)} messages from cache')
 
+    cur.close()
     return cached_messages
 
 
