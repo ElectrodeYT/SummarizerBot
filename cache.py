@@ -10,7 +10,7 @@ db_con = sqlite3.connect('data/cache.db')
 db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
-db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT PRIMARY KEY, embedding TEXT)')
+db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding TEXT, model TEXT, UNIQUE(hash, model))')
 db_con.commit()
 
 
@@ -40,9 +40,13 @@ class CachedDiscordMessage(discord.Object):
         self.author = author
         self.channel_id = channel_id
 
+    @property
+    def type(self):
+        return 'cached'
+
 
 # For this, we expect the messages to be in oldest -> newest order.
-async def commit_messages_to_cache(messages: [CachedDiscordMessage], channel: discord.TextChannel):
+async def commit_messages_to_cache(messages: list[CachedDiscordMessage], channel: discord.TextChannel):
     cur = db_con.cursor()
     for idx, message in enumerate(messages):
         # Set known prev/after message IDs
@@ -91,7 +95,7 @@ async def fetch_author_from_cache(author_id: int):
         return None
 
 
-async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Message | None = None):
+async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Message | None = None, progress_callback=None):
     cur = db_con.cursor()
     cached_messages = []
 
@@ -121,24 +125,219 @@ async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Me
             # We have reached our limit
             break
 
+        if progress_callback is not None and limit % 200 == 0:
+            try:
+                await progress_callback(len(cached_messages), len(cached_messages) + limit, "Fetched from cache")
+            except Exception:
+                # don't let progress failures stop fetching
+                pass
+
+
     if len(cached_messages):
         print(f'Fetched {len(cached_messages)} messages from cache')
 
     return cached_messages
 
 
-async def fetch_embedding_from_cache(message: CachedDiscordMessage | discord.Message):
-    hash = hashlib.sha1(message.content.encode('utf-8')).hexdigest()
-
+# Get all messages in a channel from cache. May or may not be ordered in any way!
+async def get_all_messages_in_channel_from_cache(channel: discord.TextChannel):
     cur = db_con.cursor()
-    cur.execute('SELECT embedding FROM embeddings WHERE hash = ?', (hash,))
-    embedding_str = cur.fetchone()
+    cur.execute('SELECT id, content, author_id, channel_id, previous_message_id, next_message_id'
+                ' FROM messages WHERE channel_id = ?', (channel.id,))
+    rows = cur.fetchall()
     cur.close()
 
-    if embedding_str is None:
+    cached_messages = []
+    for row in rows:
+        message_id, content, author_id, channel_id, previous_message_id, next_message_id = row
+        author = await fetch_author_from_cache(author_id)
+        if author is None:
+            continue
+
+        cached_message = CachedDiscordMessage(id=message_id, content=content, author=author,
+                                              channel_id=channel_id, before=previous_message_id,
+                                              after=next_message_id)
+        cached_messages.append(cached_message)
+
+    print(f'Fetched {len(cached_messages)} messages from cache for channel {channel.id}')
+    return cached_messages
+
+
+async def fetch_embedding_from_cache(message: CachedDiscordMessage | discord.Message | str, used_model: str):
+    if type(message) is str:
+        hash = hashlib.sha1(message.encode('utf-8')).hexdigest()
+    else:
+        hash = hashlib.sha1(message.content.encode('utf-8')).hexdigest()
+
+    cur = db_con.cursor()
+    cur.execute('SELECT embedding FROM embeddings WHERE hash = ? AND model = ?', (hash, used_model))
+    row = cur.fetchone()
+    cur.close()
+
+    if row is None:
         return None
 
-    embedding = ast.literal_eval(embedding_str)
-    assert embedding is list[float]
+    embedding_str = row[0]
+    # stored as a Python literal (list) — parse it safely
+    try:
+        embedding = ast.literal_eval(embedding_str)
+    except Exception:
+        return None
 
     return embedding
+
+async def commit_embedding_to_cache(message: CachedDiscordMessage | discord.Message | str, embedding: list[float], used_model: str):
+    if type(message) is str:
+        hash = hashlib.sha1(message.encode('utf-8')).hexdigest()
+    else:
+        hash = hashlib.sha1(message.content.encode('utf-8')).hexdigest()
+    embedding_str = str(embedding)
+
+    cur = db_con.cursor()
+    cur.execute('INSERT OR REPLACE INTO embeddings(hash, embedding, model) VALUES (?, ?, ?)', (hash, embedding_str, used_model))
+    cur.close()
+    db_con.commit()
+
+
+def discord_author_to_cached_author(author: discord.User):
+    return CachedDiscordAuthor(name=author.name, id=author.id)
+
+
+def discord_messages_to_cached_messages(discord_messages: list[discord.Message]):
+    messages = []
+    for discord_message in discord_messages:
+        messages.append(CachedDiscordMessage(content=discord_message.content, id=discord_message.id,
+                                                   author=discord_author_to_cached_author(discord_message.author),
+                                                   channel_id=discord_message.channel.id))
+
+    return messages
+
+async def get_messages_from_discord(channel: discord.TextChannel, limit=50, before=None, after=None):
+    print(f'Fetching {limit} messages from discord directly (limit={limit}, before={before}, after={after})')
+    return [message async for message in channel.history(limit=limit, before=before, after=after)]
+
+async def get_messages(channel: discord.TextChannel, limit=50, before=None, after=None, progress_callback=None):
+    messages = []
+
+    while limit > 0:
+        # TODO: handle after being true
+        assert after is None
+
+        # If before or after are both none, no requests have been made
+        # Therefore, request the first batch of messages
+        # Whenever calling to discord API, we max the limit to 50, as that is the maximum the discord API itself supports
+        if before is None and after is None:
+            discord_messages = await get_messages_from_discord(channel, limit=min(limit, 50))
+            before = discord_messages[-1]
+        elif before is not None:
+            async def fetch_from_cache_progress_callback(fetched, total, phase):
+                if progress_callback is not None:
+                    try:
+                        await progress_callback(len(messages) + fetched, len(messages) + limit, "Fetched")
+                    except Exception:
+                        # don't let progress failures stop fetching
+                        pass
+
+            # Check to see if we have a cache hit, and if we do, pull as many messages from there as we can (up to limit)
+            cached_messages = await fetch_from_cache(limit, before, fetch_from_cache_progress_callback)
+            if len(cached_messages):
+                messages.extend(cached_messages)
+                limit -= len(cached_messages)
+                before = cached_messages[-1]
+                continue
+            else:
+                # Messages not in cache, fetch them from discord
+                discord_messages = await get_messages_from_discord(channel, min(limit, 50), before=before)
+                before = discord_messages[-1]
+
+        print(f'Extending messages with {len(discord_messages)} new messages')
+        # If we got here, we need to convert the discord messages to cached messages
+        messages.extend(discord_messages_to_cached_messages(discord_messages))
+        limit -= min(limit, 50)
+
+        # Call progress callback if provided
+        if progress_callback is not None:
+            try:
+                await progress_callback(len(messages), len(messages) + limit, "Fetched")
+            except Exception:
+                # don't let progress failures stop fetching
+                pass
+        print(f'Got past the progress callback, {len(messages)} messages so far')
+
+    if before is not None:
+        # We fetched from newest, reverse array
+        messages = messages[::-1]
+
+    print(f'commiting {len(messages)} messages to cache')
+    await commit_messages_to_cache(messages, channel)
+    return messages
+
+
+async def commit_single_message_to_cache(discord_message: discord.Message):
+    """Commit a single incoming discord.Message to the cache while maintaining
+    previous_message_id/next_message_id links.
+
+    Behavior:
+    - Determine the immediate previous message in the channel (via history).
+    - Store the new message and set previous_message_id to the previous message's id (if any).
+    - If the previous message is already in the DB, set its next_message_id to this message's id.
+    - Always ensure the message's author is present in the authors table.
+    """
+    cur = db_con.cursor()
+
+    # Ensure author is present
+    author = discord_message.author
+    try:
+        cur.execute('INSERT OR REPLACE INTO authors(id, name) VALUES (?, ?)', (author.id, author.name))
+    except Exception:
+        # best-effort: ignore author insert failures
+        pass
+
+    # Try to find the immediate previous message in the channel
+    previous_id = None
+    try:
+        # Use channel.history to get the last message before this one
+        async for prev in discord_message.channel.history(limit=1, before=discord_message):
+            # Only accept the previous id if that message already exists in our DB.
+            prev_id_candidate = prev.id
+            cur.execute('SELECT id FROM messages WHERE id = ?', (prev_id_candidate,))
+            if cur.fetchone() is not None:
+                previous_id = prev_id_candidate
+            break
+    except Exception:
+        # If history access fails (permissions, etc.), leave previous_id as None
+        previous_id = None
+
+    # Insert or replace this message record. next_message_id is unknown at insert time.
+    try:
+        cur.execute(
+            'INSERT OR REPLACE INTO messages(id, content, author_id, channel_id, previous_message_id, next_message_id) VALUES (?, ?, ?, ?, ?, ?)',
+            (discord_message.id, discord_message.content, author.id, discord_message.channel.id, previous_id, None)
+        )
+        print(f'Committed message {discord_message.id} to cache with previous_id={previous_id} (content: {discord_message.content})')
+    except Exception:
+        # If insert fails for some reason, close and return
+        cur.close()
+        db_con.commit()
+        return
+
+    # If we know the previous message id, and it exists in DB, update its next_message_id
+    if previous_id is not None:
+        cur.execute('SELECT id FROM messages WHERE id = ?', (previous_id,))
+        if cur.fetchone() is not None:
+            try:
+                cur.execute('UPDATE messages SET next_message_id = ? WHERE id = ?', (discord_message.id, previous_id))
+            except Exception:
+                # ignore update errors
+                pass
+
+    cur.close()
+    db_con.commit()
+
+
+async def reconcile_channel_links(channel: discord.TextChannel, limit: int | None = None,
+                                   progress_callback=None) -> int:
+    # Call get_messages to re-fetch messages and re-commit them to the cache, which will fix up links    
+    messages = await get_messages(channel, limit=limit, before=None, after=None, progress_callback=progress_callback)
+    return len(messages)
+

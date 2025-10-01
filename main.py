@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 
 import summary_llm
+import cache
 
 discord_token = os.environ['DISCORD_TOKEN']
 default_summary_prompt = 'Summarize the conversation(s). If there are several conversations, summarize them individually.'
@@ -43,6 +44,21 @@ class DiscordClient(discord.Client):
 
     async def on_guild_join(self, guild: discord.Guild):
         await self.setup_guild_stuff(guild)
+
+    async def on_message(self, message: discord.Message) -> None:
+        # Ignore messages without a channel (safety) or from webhooks
+        try:
+            if message.channel is None:
+                return
+        except Exception:
+            return
+
+        # Best-effort: commit message to cache. Do not block on failures.
+        try:
+            await cache.commit_single_message_to_cache(message)
+        except Exception:
+            # swallow exceptions from caching to avoid disrupting bot operation
+            return
 
 
 intents = discord.Intents.default()
@@ -96,6 +112,72 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
 
+
+@client.tree.command(description='Pre-fetch older messages and reconcile channel links in the DB')
+async def reconcile_messages(interaction: discord.Interaction, count_msgs: int = 1000,
+                             channel: discord.TextChannel = None) -> None:
+    await interaction.response.send_message('Starting reconciliation, this may take a while...')
+
+    try:
+        if channel is None:
+            channel = interaction.channel
+
+        # We'll update the original response periodically to show progress
+        last_reported = {'processed': 0}
+
+        async def progress_cb(processed, total, type="Fetched"):
+            # Only edit when notable progress is made
+            if processed - last_reported['processed'] >= 25:
+                try:
+                    await interaction.edit_original_response(content=f'{type} {processed}/{total} messages...')
+                    last_reported['processed'] = processed
+                except Exception:
+                    pass
+
+        processed = await cache.reconcile_channel_links(channel, limit=count_msgs, progress_callback=progress_cb)
+
+        await interaction.edit_original_response(content=f'Reconciled {processed} messages for channel {channel.name}')
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+#TODO
+#@client.tree.command(description="Find a message by using a sentence as a search query. (Only searches cached messages)")
+
+async def find_message(interaction: discord.Interaction, query: str, channel: discord.TextChannel = None) -> None:
+    await interaction.response.send_message('Searching, this may take a while...', ephemeral=True)
+
+    try:
+        if channel is None:
+            channel = interaction.channel
+
+        # Fetch messages from cache
+        cached_messages = await cache.get_all_messages_in_channel_from_cache(channel)
+
+        if len(cached_messages) == 0:
+            await interaction.edit_original_response(content=f'No cached messages found for channel {channel.name}')
+            return
+
+        await interaction.edit_original_response(content=f'Found {len(cached_messages)} cached messages, running search...')
+
+        # Format messages into plain text for the embeddings
+        cached_messages_text = [msg.content for msg in cached_messages if msg.content is not None and len(msg.content) > 0]
+
+        # Run embeddings and find best match
+        question_embedding, message_embeddings = await summary_llm.run_embeddings(interaction, query, cached_messages_text)
+
+        best_match_index = message_embeddings.index(max(message_embeddings, key=lambda x: x[0]))
+        best_match_message = cached_messages[best_match_index]
+        best_match_score = message_embeddings[best_match_index][0] * 100
+
+        embed = discord.Embed(title="Best Match", description=best_match_message)
+        embed.add_field(name="Match Score", value=f"{best_match_score:.2f}%")
+        embed.set_footer(text=f"From channel {channel.name}")
+
+        await interaction.edit_original_response(content='', embed=embed)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
 
 async def uwuify_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
     await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)

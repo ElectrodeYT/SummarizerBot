@@ -1,7 +1,7 @@
 import discord
 import os
 from datetime import datetime
-import cache
+from cache import *
 import io
 
 from openai import AsyncOpenAI
@@ -35,62 +35,6 @@ def format_message_list_for_embeddings(messages: [discord.Message]):
         formatted_messages.append(f'{discord_message.content}')
 
     return formatted_messages
-
-
-def discord_author_to_cached_author(author: discord.User):
-    return cache.CachedDiscordAuthor(name=author.name, id=author.id)
-
-
-def discord_messages_to_cached_messages(discord_messages: [discord.Message]):
-    messages = []
-    for discord_message in discord_messages:
-        messages.append(cache.CachedDiscordMessage(content=discord_message.content, id=discord_message.id,
-                                                   author=discord_author_to_cached_author(discord_message.author),
-                                                   channel_id=discord_message.channel.id))
-
-    return messages
-
-async def get_messages_from_discord(channel: discord.TextChannel, limit=50, before=None, after=None):
-    print(f'Fetching {limit} messages from discord directly (limit={limit}, before={before}, after={after})')
-    return [message async for message in channel.history(limit=limit, before=before, after=after)]
-
-async def get_messages(channel: discord.TextChannel, limit=50, before=None, after=None):
-    messages = []
-
-    while limit > 0:
-        # TODO: handle after being true
-        assert after is None
-
-        # If before or after are both none, no requests have been made
-        # Therefore, request the first batch of messages
-        # Whenever calling to discord API, we max the limit to 50, as that is the maximum the discord API itself supports
-        if before is None and after is None:
-            discord_messages = await get_messages_from_discord(channel, limit=min(limit, 50))
-            before = discord_messages[-1]
-        elif before is not None:
-            # Check to see if we have a cache hit, and if we do, pull as many messages from there as we can (up to limit)
-            cached_messages = await cache.fetch_from_cache(limit, before)
-            if len(cached_messages):
-                messages.extend(cached_messages)
-                limit -= len(cached_messages)
-                before = cached_messages[-1]
-                continue
-            else:
-                # Messages not in cache, fetch them from discord
-                discord_messages = await get_messages_from_discord(channel, limit, before=before)
-                before = discord_messages[-1]
-
-        # If we got here, we need to convert the discord messages to cached messages
-        messages.extend(discord_messages_to_cached_messages(discord_messages))
-        limit -= min(limit, 50)
-
-    if before is not None:
-        # We fetched from newest, reverse array
-        messages = messages[::-1]
-
-    print(f'commiting {len(messages)} messages to cache')
-    await cache.commit_messages_to_cache(messages, channel)
-    return messages
 
 
 async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: discord.Embed):
@@ -141,13 +85,40 @@ async def run_llm(interaction: discord.Interaction, llm_messages: [], embed: dis
         await interaction.edit_original_response(embed=embed)
 
 
-async def run_embeddings(interaction: discord.Interaction, base_sentence: str, messages: []):
-    model = 'bge-multilingual-gemma2'
-
+async def fetch_and_cache_embeddings(messages: [],  model: str):
     message_embeddings_response = await ai_client.embeddings.create(
         input=messages,
         model=model,
     )
+
+    # Commit the generated embeddings to cache
+    for message, embedding_response in zip(messages, message_embeddings_response.data):
+        await commit_embedding_to_cache(message, embedding_response.embedding, model)
+
+    return message_embeddings_response
+
+async def run_embeddings(interaction: discord.Interaction, base_sentence: str, messages: []):
+    model = 'bge-multilingual-gemma2'
+
+    message_embeddings = []
+    message_embeddings_to_fetch = []
+
+    # Try to fetch from cache first
+    for message in messages:
+        cached_embedding = await fetch_embedding_from_cache(message, model)
+        if cached_embedding is not None:
+            message_embeddings.append(cached_embedding)
+        else:
+            message_embeddings_to_fetch.append(message)
+
+    # Fetch embeddings for messages not in cache
+    # We do this in chunks of 1024 messages as the API doesn't support more than that
+    message_embeddings_response = []
+    if len(message_embeddings_to_fetch) != 0:
+        for i in range(0, len(message_embeddings_to_fetch), 1024):
+            chunk = message_embeddings_to_fetch[i:i + 1024]
+            fetched_message_embeddings = await fetch_and_cache_embeddings(chunk, model)
+            message_embeddings_response.extend(fetched_message_embeddings.data)
 
     question_embeddings_response = await ai_client.embeddings.create(
         input=base_sentence,
@@ -155,9 +126,8 @@ async def run_embeddings(interaction: discord.Interaction, base_sentence: str, m
     )
 
     # Convert the embedding responses into float arrays
-    message_embeddings = []
     question_embeddings = question_embeddings_response.data[0].embedding
-    for embedding_response in message_embeddings_response.data:
+    for embedding_response in message_embeddings_response:
         message_embeddings.append(embedding_response.embedding)
 
     # Compare embeddings
