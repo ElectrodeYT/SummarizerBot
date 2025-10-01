@@ -335,6 +335,36 @@ async def commit_single_message_to_cache(discord_message: discord.Message):
     db_con.commit()
 
 
+async def update_message_in_cache(discord_message: discord.Message) -> bool:
+    """If the message exists in the DB, update its content (and author name) and return True.
+    If the message is not present, return False.
+    """
+    cur = db_con.cursor()
+    try:
+        cur.execute('SELECT id FROM messages WHERE id = ?', (discord_message.id,))
+        if cur.fetchone() is None:
+            cur.close()
+            return False
+
+        # Update author name in authors table as well
+        try:
+            cur.execute('INSERT OR REPLACE INTO authors(id, name) VALUES (?, ?)', (discord_message.author.id, discord_message.author.name))
+        except Exception:
+            pass
+
+        # Update the message content
+        cur.execute('UPDATE messages SET content = ? WHERE id = ?', (discord_message.content, discord_message.id))
+        db_con.commit()
+        cur.close()
+        return True
+    except Exception:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        return False
+
+
 async def reconcile_channel_links(channel: discord.TextChannel, limit: int | None = None,
                                    progress_callback=None) -> int:
     # Call get_messages to re-fetch messages and re-commit them to the cache, which will fix up links    

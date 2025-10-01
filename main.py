@@ -60,6 +60,14 @@ class DiscordClient(discord.Client):
             # swallow exceptions from caching to avoid disrupting bot operation
             return
 
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        # Best-effort: update cached message content if present in DB
+        try:
+            await cache.update_message_in_cache(after)
+        except Exception:
+            # swallow exceptions to avoid disrupting bot runtime
+            return
+
 
 intents = discord.Intents.default()
 intents.message_content = True
