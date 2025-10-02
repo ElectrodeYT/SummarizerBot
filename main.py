@@ -246,12 +246,16 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
         sims = np.concatenate(sims_parts)
 
         # 4) Pick top_k indices
-        top_idx = sims.argsort()[-top_k:][::-1]
+        top_idx = sims.argsort()[::-1]
 
         # 5) For each result, fetch nearby context and build a snippet
         # Build initial result list with context message ids
         results = []
+        seen_ids = set()
         for idx in top_idx:
+            if len(results) >= top_k:
+                break
+
             item = grouped[int(idx)]
             score = float(sims[int(idx)])
             # pick the most recent message id in the grouped block as representative
@@ -262,6 +266,12 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
 
             # Collect context ids for deduplication
             context_ids = set([c.get('id') for c in context if c.get('id') is not None])
+
+            if context_ids & seen_ids:
+                # overlap with an accepted, higher-quality result -> skip
+                continue
+
+            seen_ids |= context_ids
 
             # Build a snippet with usernames and highlight the central message
             snippet_lines = []
@@ -282,22 +292,11 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
                     continue
 
             snippet = '\n'.join(snippet_lines)
-            results.append((score, item, snippet, context_ids))
+            results.append((score, item, snippet))
 
-        # 6) Deduplicate overlapping results: prefer higher-scoring results and skip any whose
-        # context overlaps with an already-accepted result.
-        accepted = []
-        seen_ids = set()
-        for score, item, snippet, ctx_ids in results:
-            if ctx_ids & seen_ids:
-                # overlap with an accepted, higher-quality result -> skip
-                continue
-            accepted.append((score, item, snippet))
-            seen_ids |= ctx_ids
-
-        # 7) Build embed to return (compact)
+        # 6) Build embed to return (compact)
         embed = discord.Embed(title=f'Search results for "{query}" (top {top_k})')
-        for score, item, snippet in accepted:
+        for score, item, snippet in results:
             top_id = item.message_ids[0] if item.message_ids else None
             # Build a Discord message jump link to the top (earliest) message in the block
             jump_link = None
@@ -307,14 +306,13 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
             except Exception:
                 jump_link = None
 
-            block_author = getattr(item.author, 'name', 'Unknown') if item and item.author else 'Unknown'
-            title = f"Score: {score:.4f} — {block_author} — ID: {top_id}"
+            title = f"Score: {score:.4f}"
             snippet_text = (snippet or '')
             if snippet_text and len(snippet_text) > 1000:
                 snippet_text = snippet_text[:1000] + '...'
 
             if jump_link:
-                value = f"[Jump to top]({jump_link})\n\n{snippet_text}"
+                value = f"[Jump to messages]({jump_link})\n\n{snippet_text}"
             else:
                 value = snippet_text or ''
 
