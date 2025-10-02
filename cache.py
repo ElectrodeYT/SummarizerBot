@@ -175,11 +175,11 @@ async def fetch_from_cache(limit: int, before: CachedDiscordMessage | discord.Me
     return cached_messages
 
 
-# Get all messages in a channel from cache. May or may not be ordered in any way!
+# Get all messages in a channel from cache.
 async def get_all_messages_in_channel_from_cache(channel: discord.TextChannel):
     cur = db_con.cursor()
     cur.execute('SELECT id, content, author_id, channel_id, previous_message_id, next_message_id'
-                ' FROM messages WHERE channel_id = ?', (channel.id,))
+                ' FROM messages WHERE channel_id = ? ORDER BY id ASC', (channel.id,))
     rows = cur.fetchall()
     cur.close()
 

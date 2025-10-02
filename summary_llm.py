@@ -13,6 +13,59 @@ from pprint import pprint
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+def estimate_tokens(text: str, model_name: str | None = None) -> int:
+    """Estimate token count for a text. Tries to use tiktoken if available, otherwise falls back to a simple heuristic (chars/4)."""
+    if not text:
+        return 0
+    try:
+        import tiktoken
+        try:
+            if model_name:
+                enc = tiktoken.encoding_for_model(model_name)
+            else:
+                enc = tiktoken.get_encoding('o200k_harmony')
+        except Exception:
+            enc = tiktoken.get_encoding('o200k_harmony')
+        return len(enc.encode(text))
+    except Exception:
+        # conservative heuristic: 1 token per 4 characters
+        return max(1, int(len(text) / 4))
+
+
+def count_tokens(obj, model_name: str | None = None, per_message_overhead: bool = True) -> int:
+    """Count tokens for various inputs.
+
+    Supports:
+    - strings: treated as a single message content (adds per-message overhead when per_message_overhead=True)
+    - list of strings: each element treated as a separate message
+    - dict with keys 'role' and 'content': counts tokens for role and content and adds per-message overhead
+    - list of dicts: sums over the dicts
+
+    The per_message_overhead accounts for the "start/end" tokens (4 tokens) per message when True.
+    """
+    OVERHEAD_PER_MESSAGE = 4 if per_message_overhead else 0
+
+    # Single string -> count tokens for the content and add overhead
+    if isinstance(obj, str):
+        return estimate_tokens(obj, model_name) + OVERHEAD_PER_MESSAGE
+
+    # Dict with role/content
+    if isinstance(obj, dict):
+        role = obj.get('role', '')
+        content = obj.get('content', '')
+        return estimate_tokens(str(role), model_name) + estimate_tokens(str(content), model_name) + OVERHEAD_PER_MESSAGE
+
+    # List -> sum elements (support list of strings or list of dicts)
+    if isinstance(obj, list):
+        total = 0
+        for elem in obj:
+            # For nested lists/dicts/strings, recurse; keep per_message_overhead as-is
+            total += count_tokens(elem, model_name=model_name, per_message_overhead=per_message_overhead)
+        return total
+
+    # Fallback: stringify and count
+    return estimate_tokens(str(obj), model_name) + OVERHEAD_PER_MESSAGE
+
 scaleway_token = os.environ['SCW_TOKEN']
 
 ai_client = AsyncOpenAI(
@@ -107,7 +160,8 @@ async def create_search_embeddings(channel: discord.TextChannel, model: str = 'b
     max_chars = max(1, int(max_tokens * 4))
 
     def estimate_tokens_for_text(t: str) -> int:
-        return max(1, int(len(t) / 4))
+        # Use the lighter-weight estimate for grouping/embeddings stage (no per-message overhead)
+        return estimate_tokens(t)
 
     context_texts: List[Optional[str]] = []
     for i in range(len(blocks)):
@@ -325,13 +379,188 @@ async def run_embeddings(interaction: discord.Interaction, base_sentence: str, m
 
 
 async def create_summary(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
-                         footer_text: str):
-    llm_messages = [{'role': 'system',
-                     'content': f'You should summarize the following messages according to this prompt: '
-                                f'"{summarize_prompt}". Use only information mentioned in the following messages.'
-                     }]
+                         footer_text: str, show_when_context_too_large: bool = True):
+    # Build a participants summary to give the LLM additional context about who is involved
+    participants: dict = {}
+    total_msgs = len(discord_messages)
+    for m in discord_messages:
+        try:
+            author = getattr(m, 'author', None)
+            if author is None:
+                continue
+            uid = getattr(author, 'id', None)
+            name = getattr(author, 'name', 'Unknown')
+            if uid not in participants:
+                participants[uid] = {'name': name, 'count': 0}
+            participants[uid]['count'] += 1
+        except Exception:
+            continue
 
-    for message in format_message_list(discord_messages):
+    # Use the Discord API to fetch Member objects so we can get display_name and roles.
+    guild = getattr(interaction, 'guild', None)
+    for uid in list(participants.keys()):
+        display_name = participants[uid].get('name', 'Unknown')
+        roles_set = set()
+        if guild is not None and uid is not None:
+            try:
+                member = guild.get_member(uid)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(uid)
+                    except Exception:
+                        member = None
+                if member is not None:
+                    display_name = getattr(member, 'display_name', display_name)
+                    try:
+                        for r in getattr(member, 'roles', []):
+                            rname = getattr(r, 'name', None)
+                            if rname and rname != '@everyone':
+                                roles_set.add(rname)
+                    except Exception:
+                        pass
+            except Exception:
+                # best-effort; fall back to author name
+                pass
+
+        participants[uid]['display_name'] = display_name
+        participants[uid]['roles'] = roles_set
+
+    # If there are many messages, limit participants to those contributing >= 3%
+    parts = []
+    threshold = None
+    if total_msgs > 3000:
+        threshold = max(1, int(total_msgs * 0.03))
+
+    for uid, info in participants.items():
+        display_name = info.get('display_name', info.get('name', 'Unknown'))
+        username = info.get('name', 'Unknown')
+        count = info.get('count', 0)
+        if threshold is not None and count < threshold:
+            continue
+        roles = sorted(info.get('roles', []))
+        roles_str = ', '.join(roles) if roles else 'none'
+        line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
+        parts.append(line)
+
+    participants_summary = 'Major Participants:\n' + '\n'.join(parts) if parts else ''
+
+    system_content = (
+        f'You should summarize the following messages according to this prompt: '
+        f'"{summarize_prompt}". Use only information mentioned in the following messages.\n\n'
+        f'{participants_summary}\n\n'
+        f'If some messages do not contain any information relevant to the prompt, ignore them.\n\n'
+        f'In your response, refer to people by their display name, rather than user name, when possible.'
+    )
+
+    # Prepare formatted messages
+    formatted_messages = format_message_list(discord_messages)
+    # First: prepare formatted messages and cull by token budget BEFORE building participants summary.
+    formatted_messages = format_message_list(discord_messages)
+    MODEL_CONTEXT_TOKENS = 126_000
+    RESERVED_RESPONSE_TOKENS = 8_192
+    RESERVED_PARTICIPANT_TOKENS = 2_000
+
+    # Base system text without participants summary
+    system_base = (
+        f'You should summarize the following messages according to this prompt: '
+        f'"{summarize_prompt}". Use only information mentioned in the following messages.\n\n'
+        f'If some messages do not contain any information relevant to the prompt, ignore them.\n\n'
+        f'In your response, refer to people by their display name, rather than user name, when possible.'
+    )
+
+    # Count system_base as a system message (include role + overhead)
+    system_base_tokens = count_tokens({'role': 'system', 'content': system_base})
+    allowed_for_messages = MODEL_CONTEXT_TOKENS - RESERVED_RESPONSE_TOKENS - RESERVED_PARTICIPANT_TOKENS - system_base_tokens
+    if allowed_for_messages < 0:
+        allowed_for_messages = 0
+
+    # Count each formatted message as a separate user message (include per-message overhead)
+    msg_tokens = [count_tokens(m) for m in formatted_messages]
+    total_msg_tokens = sum(msg_tokens)
+    print(f'Total message tokens: {total_msg_tokens}, allowed for messages: {allowed_for_messages}')
+
+    removed_count = 0
+    # Remove oldest messages until remaining message tokens fit the allowed budget for messages
+    while formatted_messages and total_msg_tokens > allowed_for_messages:
+        removed_tok = msg_tokens.pop(0)
+        formatted_messages.pop(0)
+        total_msg_tokens -= removed_tok
+        removed_count += 1
+
+    # Note truncation in footer if messages were removed
+    if removed_count > 0:
+        footer_text = footer_text + f'\n\nNote: {removed_count} earlier message(s) were omitted to fit the model context.'
+
+    # Recompute the truncated discord_messages slice so participants are based on included messages
+    truncated_discord_messages = discord_messages[-len(formatted_messages):] if formatted_messages else []
+
+    # Now build participants summary from truncated messages and fit it into RESERVED_PARTICIPANT_TOKENS
+    participants: dict = {}
+    for m in truncated_discord_messages:
+        try:
+            author = getattr(m, 'author', None)
+            if author is None:
+                continue
+            uid = getattr(author, 'id', None)
+            name = getattr(author, 'name', 'Unknown')
+            if uid not in participants:
+                participants[uid] = {'name': name, 'count': 0}
+            participants[uid]['count'] += 1
+        except Exception:
+            continue
+
+    # Prepare to fetch member info as needed and include as many top participants as fit
+    guild = getattr(interaction, 'guild', None)
+    # Sort participants by message count desc
+    sorted_participants = sorted(participants.items(), key=lambda kv: kv[1].get('count', 0), reverse=True)
+
+    parts = []
+    used_participant_tokens = 0
+    for uid, info in sorted_participants:
+        # attempt to resolve display name and roles
+        display_name = info.get('name', 'Unknown')
+        roles_set = set()
+        if guild is not None and uid is not None:
+            try:
+                member = guild.get_member(uid)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(uid)
+                    except Exception:
+                        member = None
+                if member is not None:
+                    display_name = getattr(member, 'display_name', display_name)
+                    try:
+                        for r in getattr(member, 'roles', []):
+                            rname = getattr(r, 'name', None)
+                            if rname and rname != '@everyone':
+                                roles_set.add(rname)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        username = info.get('name', 'Unknown')
+        count = info.get('count', 0)
+        roles = sorted(roles_set)
+        roles_str = ', '.join(roles) if roles else 'none'
+        line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
+        # Participant summary lines are part of the system content, do NOT include per-message overhead
+        tok = count_tokens(line, per_message_overhead=False)
+        if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
+            # no room for this participant line, stop adding participants
+            break
+        parts.append(line)
+        used_participant_tokens += tok
+
+    participants_summary = 'Major Participants:\n' + '\n'.join(parts) if parts else ''
+
+    # Build final system content including the participants summary
+    system_content = system_base + '\n\n' + participants_summary if participants_summary else system_base
+
+    # Assemble llm_messages from truncated formatted_messages
+    llm_messages = [{'role': 'system', 'content': system_content}]
+    for message in formatted_messages:
         llm_messages.append({'role': 'user', 'content': message})
 
     # Stream the summary

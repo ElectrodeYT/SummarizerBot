@@ -108,8 +108,18 @@ client = DiscordClient(intents=intents)
 
 
 @client.tree.command()
-async def summarize(interaction: discord.Interaction, count_msgs: int = 1500, channel: discord.TextChannel = None,
+async def summarize(interaction: discord.Interaction, count_msgs: int | None = None, channel: discord.TextChannel = None,
                     summarize_prompt: str = default_summary_prompt) -> None:
+    """
+    Summarize messages in a channel.
+
+    Args:
+        interaction (discord.Interaction): The interaction object.
+        count_msgs (int | None): Number of messages to summarize. If None, summarize all cached messages for the channel.
+        channel (discord.TextChannel | None): The channel to summarize messages from. If None, use the channel where the command was invoked.
+        summarize_prompt (str): The prompt to use for summarization.
+    """
+    # If count_msgs is omitted, we will summarize all messages currently cached for this channel.
     await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
     try:
@@ -119,8 +129,11 @@ async def summarize(interaction: discord.Interaction, count_msgs: int = 1500, ch
         await interaction.edit_original_response(
             content='Doing stuff, might take a (long) while... (compiling messages)')
 
-        # Get the messages, then invert the array
-        discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
+        # Get the messages. If no count was provided, default to all cached messages for this channel.
+        if count_msgs is None:
+            discord_messages = await cache.get_all_messages_in_channel_from_cache(channel)
+        else:
+            discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
         footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}'
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
@@ -131,8 +144,9 @@ async def summarize(interaction: discord.Interaction, count_msgs: int = 1500, ch
 
 
 @client.tree.command(description='Summarize for topic')
-async def summarize_topic(interaction: discord.Interaction, topic: str, count_msgs: int = 1500,
+async def summarize_topic(interaction: discord.Interaction, topic: str, count_msgs: int | None = None,
                           channel: discord.TextChannel = None) -> None:
+    # If count_msgs is omitted, summarize all cached messages for the channel by default.
     await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
     try:
@@ -142,8 +156,11 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
         await interaction.edit_original_response(
             content='Doing stuff, might take a (long) while... (compiling messages)')
 
-        # Get the messages, then invert the array
-        discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
+        # Get the messages. If no count was provided, default to all cached messages for this channel.
+        if count_msgs is None:
+            discord_messages = await cache.get_all_messages_in_channel_from_cache(channel)
+        else:
+            discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
 
         footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Topic: {topic}'
 
