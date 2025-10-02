@@ -75,6 +75,32 @@ class DiscordClient(discord.Client):
             # swallow exceptions to avoid disrupting bot runtime
             return
 
+    async def on_raw_message_delete(self, payload) -> None:
+        # Handle deletions where only the message ID is available (e.g., messages older than cache or partial state).
+        try:
+            # payload has attribute message_id
+            msg_id = getattr(payload, 'message_id', None)
+            if msg_id is None:
+                return
+            await cache.delete_message_from_cache(msg_id)
+        except Exception:
+            # best-effort: don't let exceptions propagate
+            return
+
+    async def on_raw_bulk_message_delete(self, payload) -> None:
+        # Best-effort: handle raw bulk delete events where only message IDs are provided
+        try:
+            msg_ids = getattr(payload, 'message_ids', None)
+            if not msg_ids:
+                return
+            for mid in msg_ids:
+                try:
+                    await cache.delete_message_from_cache(mid)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -158,8 +184,6 @@ async def reconcile_messages(interaction: discord.Interaction, count_msgs: int =
 
 
 @client.tree.command(description='Show cache status for a channel')
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 async def cache_status(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
     await interaction.response.send_message('Fetching cache status...', ephemeral=True)
 
@@ -360,14 +384,12 @@ async def uwuify_impl(interaction: discord.Interaction, message: discord.Message
 
 
 @client.tree.context_menu(name='UwU-ify message :3')
-@app_commands.allowed_installs(guilds=False, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def uwuify(interaction: discord.Interaction, message: discord.Message):
     await uwuify_impl(interaction=interaction, message=message, ephemeral=False)
 
 
 @client.tree.context_menu(name='UwU-ify message (Keep Private)')
-@app_commands.allowed_installs(guilds=False, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def uwuify_ephemeral(interaction: discord.Interaction, message: discord.Message):
     await uwuify_impl(interaction=interaction, message=message, ephemeral=True)
@@ -411,13 +433,11 @@ async def zoomer_translator_impl(interaction: discord.Interaction, message: disc
         raise
 
 @client.tree.context_menu(name='Zoomer Translator')
-@app_commands.allowed_installs(guilds=False, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def zoomer_translator(interaction: discord.Interaction, message: discord.Message):
     await zoomer_translator_impl(interaction=interaction, message=message, ephemeral=False)
 
 @client.tree.context_menu(name='Zoomer Translator (Keep Private)')
-@app_commands.allowed_installs(guilds=False, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def zoomer_translator_ephemeral(interaction: discord.Interaction, message: discord.Message):
     await zoomer_translator_impl(interaction=interaction, message=message, ephemeral=True)

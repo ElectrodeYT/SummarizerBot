@@ -449,6 +449,67 @@ async def update_message_in_cache(discord_message: discord.Message) -> bool:
         return False
 
 
+async def delete_message_from_cache(message: discord.Message | int) -> bool:
+    """Remove a message from the cache and fix linked previous/next pointers.
+
+    Accepts either a discord.Message or an integer message id. Returns True if a row was
+    deleted, False otherwise.
+    """
+    # Normalize to id
+    if isinstance(message, int):
+        message_id = message
+    else:
+        try:
+            message_id = int(message.id)
+        except Exception:
+            return False
+
+    cur = db_con.cursor()
+    try:
+        print(f'[cache] delete_message_from_cache: message_id={message_id}')
+        # Find the neighbouring pointers for this message
+        cur.execute('SELECT previous_message_id, next_message_id FROM messages WHERE id = ?', (message_id,))
+        row = cur.fetchone()
+        if row is None:
+            print(f'[cache] delete_message_from_cache: message_id={message_id} not found in DB')
+            cur.close()
+            return False
+
+        prev_id, next_id = row
+        print(f'[cache] delete_message_from_cache: prev_id={prev_id}, next_id={next_id}')
+
+        # Update previous' next_message_id to skip this message
+        if prev_id is not None:
+            try:
+                cur.execute('UPDATE messages SET next_message_id = ? WHERE id = ?', (next_id, prev_id))
+                print(f'[cache] Updated prev ({prev_id}). next_message_id -> {next_id} (rows={cur.rowcount})')
+            except Exception as e:
+                print(f'[cache] Failed to update prev ({prev_id}): {e}')
+
+        # Update next's previous_message_id to skip this message
+        if next_id is not None:
+            try:
+                cur.execute('UPDATE messages SET previous_message_id = ? WHERE id = ?', (prev_id, next_id))
+                print(f'[cache] Updated next ({next_id}). previous_message_id -> {prev_id} (rows={cur.rowcount})')
+            except Exception as e:
+                print(f'[cache] Failed to update next ({next_id}): {e}')
+
+        # Delete the message row itself
+        cur.execute('DELETE FROM messages WHERE id = ?', (message_id,))
+        deleted = cur.rowcount
+        db_con.commit()
+        cur.close()
+        print(f'[cache] delete_message_from_cache: deleted_rows={deleted}')
+        return deleted > 0
+    except Exception as e:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        print(f'[cache] delete_message_from_cache: exception: {e}')
+        return False
+
+
 async def reconcile_channel_links(channel: discord.TextChannel, limit: int | None = None,
                                    progress_callback=None) -> int:
     # Call get_messages to re-fetch messages and re-commit them to the cache, which will fix up links    
