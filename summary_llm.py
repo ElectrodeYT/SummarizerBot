@@ -79,11 +79,12 @@ async def create_search_embeddings(channel: discord.TextChannel, model: str = 'b
             except Exception:
                 pass
 
-    # Build concatenated texts and check cache for embeddings
+    # Build concatenated texts for each grouped block (include usernames)
     blocks = []  # tuples (author, concat_text, [ids])
     for author, msgs in groups:
         ids = [int(x.id) for x in msgs]
-        concat = '\n'.join([m.content for m in msgs if m.content is not None])
+        # Prefix each message with the author's username to preserve speaker attribution
+        concat = '\n'.join([f"{m.author.name}: {m.content}" for m in msgs if m.content is not None])
         blocks.append((author, concat, ids))
 
     total = len(blocks)
@@ -99,20 +100,32 @@ async def create_search_embeddings(channel: discord.TextChannel, model: str = 'b
     need_fetch_indices = []
     results: List[SearchEmbedding] = []
 
-    # Compute SHA1 hashes for each concatenated block (same scheme as cache)
-    hashes = [hashlib.sha1(concat.encode('utf-8')).hexdigest() for (_author, concat, _ids) in blocks]
+    # Build contexted texts: for each block, include up to 3 previous and 3 next block texts
+    context_radius = 3
+    context_texts: List[str] = []
+    for i in range(len(blocks)):
+        start = max(0, i - context_radius)
+        end = min(len(blocks), i + context_radius + 1)
+        # join the block texts in context window; keep order oldest->newest
+        window_texts = [blocks[j][1] for j in range(start, end)]
+        context_text = '\n'.join(window_texts)
+        context_texts.append(context_text)
 
-    # Fetch all found embeddings in a single (chunked) DB call
+    # Compute SHA1 hashes for each contexted block (same scheme as cache)
+    hashes = [hashlib.sha1(txt.encode('utf-8')).hexdigest() for txt in context_texts]
+
+    # Fetch all found embeddings in a single (chunked) DB call for the contexted texts
     cached_map = await fetch_embeddings_for_hashes(hashes, model)
 
     cache_searched = 0
-    for idx, (author, concat, ids) in enumerate(blocks):
+    for idx, (author, _concat, ids) in enumerate(blocks):
         h = hashes[idx]
         emb = cached_map.get(h)
-        se = SearchEmbedding(author=author, content=concat, message_ids=ids, embedding=emb, model=model)
+        # Use the contexted text as the content associated with the embedding
+        se = SearchEmbedding(author=author, content=context_texts[idx], message_ids=ids, embedding=emb, model=model)
         results.append(se)
         if emb is None:
-            need_fetch_texts.append(concat)
+            need_fetch_texts.append(context_texts[idx])
             need_fetch_indices.append(idx)
         cache_searched += 1
         # report after checking cache in batches

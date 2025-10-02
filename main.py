@@ -258,7 +258,26 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
             context = []
             if rep_id is not None:
                 context = await cache.get_context_for_message(channel, rep_id, before=3, after=3)
-            snippet = '\n'.join([f"{c['content'][:200]}" for c in context if c.get('content')])
+
+            # Build a snippet with usernames and highlight the central message
+            snippet_lines = []
+            for c in context:
+                try:
+                    content = c.get('content') or ''
+                    short = content[:200]
+                    author_obj = await cache.fetch_author_from_cache(c.get('author_id'))
+                    author_name = author_obj.name if author_obj is not None else 'Unknown'
+                    if rep_id is not None and c.get('id') == rep_id:
+                        # bold the central message to make it stand out
+                        line = f"**{author_name}: {short}**"
+                    else:
+                        line = f"{author_name}: {short}"
+                    snippet_lines.append(line)
+                except Exception:
+                    # best-effort: skip problematic context rows
+                    continue
+
+            snippet = '\n'.join(snippet_lines)
             results.append((score, item, snippet))
 
         # 6) Build embed to return (compact)
@@ -273,7 +292,8 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
             except Exception:
                 jump_link = None
 
-            title = f"Score: {score:.4f} — ID: {top_id}"
+            block_author = getattr(item.author, 'name', 'Unknown') if item and item.author else 'Unknown'
+            title = f"Score: {score:.4f} — {block_author} — ID: {top_id}"
             snippet_text = (snippet or '')
             if snippet_text and len(snippet_text) > 1000:
                 snippet_text = snippet_text[:1000] + '...'
