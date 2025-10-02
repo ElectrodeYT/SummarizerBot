@@ -3,6 +3,7 @@ import hashlib
 import sqlite3
 import discord
 import os
+import numpy as np
 
 from pprint import pprint
 
@@ -20,7 +21,7 @@ except Exception:
 db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
-db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding TEXT, model TEXT, UNIQUE(hash, model))')
+db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding BLOB, model TEXT, UNIQUE(hash, model))')
 
 # Create helpful indices for faster lookups
 try:
@@ -212,24 +213,73 @@ async def fetch_embedding_from_cache(message: CachedDiscordMessage | discord.Mes
     if row is None:
         return None
 
-    embedding_str = row[0]
-    # stored as a Python literal (list) — parse it safely
+    embedding_data = row[0]
+    # Support both legacy TEXT storage (Python literal) and new BLOB (float32 bytes)
     try:
-        embedding = ast.literal_eval(embedding_str)
+        if isinstance(embedding_data, (bytes, bytearray)):
+            emb = np.frombuffer(embedding_data, dtype=np.float32)
+            return emb
+        else:
+            # legacy serialized Python literal
+            embedding = ast.literal_eval(embedding_data)
+            return np.asarray(embedding, dtype=np.float32)
     except Exception:
         return None
 
-    return embedding
+
+async def fetch_embeddings_for_hashes(hashes: list[str], used_model: str) -> dict:
+    """Fetch embeddings for multiple hashes in a single query.
+
+    Returns a mapping hash -> embedding (list) for found embeddings.
+    """
+    if not hashes:
+        return {}
+
+    cur = db_con.cursor()
+    found = {}
+    # Query in chunks to avoid too large IN lists
+    chunk_size = 500
+    for i in range(0, len(hashes), chunk_size):
+        chunk = hashes[i:i + chunk_size]
+        placeholders = ','.join('?' for _ in chunk)
+        sql = f'SELECT hash, embedding FROM embeddings WHERE hash IN ({placeholders}) AND model = ?'
+        params = chunk + [used_model]
+        try:
+            cur.execute(sql, params)
+            for row in cur.fetchall():
+                h_val, embedding_data = row
+                try:
+                    if isinstance(embedding_data, (bytes, bytearray)):
+                        emb = np.frombuffer(embedding_data, dtype=np.float32)
+                    else:
+                        emb_list = ast.literal_eval(embedding_data)
+                        emb = np.asarray(emb_list, dtype=np.float32)
+                except Exception:
+                    emb = None
+                if emb is not None:
+                    found[h_val] = emb
+        except Exception:
+            # ignore DB errors and continue
+            continue
+
+    cur.close()
+    return found
 
 async def commit_embedding_to_cache(message: CachedDiscordMessage | discord.Message | str, embedding: list[float], used_model: str):
     if type(message) is str:
         hash = hashlib.sha1(message.encode('utf-8')).hexdigest()
     else:
         hash = hashlib.sha1(message.content.encode('utf-8')).hexdigest()
-    embedding_str = str(embedding)
+    # Ensure numpy float32 representation for compact storage
+    try:
+        arr = np.asarray(embedding, dtype=np.float32)
+        blob = arr.tobytes()
+    except Exception:
+        # Fallback: store as text representation if numpy fails for some reason
+        blob = str(embedding).encode('utf-8')
 
     cur = db_con.cursor()
-    cur.execute('INSERT OR REPLACE INTO embeddings(hash, embedding, model) VALUES (?, ?, ?)', (hash, embedding_str, used_model))
+    cur.execute('INSERT OR REPLACE INTO embeddings(hash, embedding, model) VALUES (?, ?, ?)', (hash, blob, used_model))
     cur.close()
     db_con.commit()
 
@@ -283,9 +333,10 @@ async def get_messages(channel: discord.TextChannel, limit=50, before=None, afte
             else:
                 # Messages not in cache, fetch them from discord
                 discord_messages = await get_messages_from_discord(channel, min(limit, 50), before=before)
+                if len(discord_messages) == 0:
+                    break
                 before = discord_messages[-1]
 
-        print(f'Extending messages with {len(discord_messages)} new messages')
         # If we got here, we need to convert the discord messages to cached messages
         messages.extend(discord_messages_to_cached_messages(discord_messages))
         limit -= min(limit, 50)
@@ -297,13 +348,11 @@ async def get_messages(channel: discord.TextChannel, limit=50, before=None, afte
             except Exception:
                 # don't let progress failures stop fetching
                 pass
-        print(f'Got past the progress callback, {len(messages)} messages so far')
 
     if before is not None:
         # We fetched from newest, reverse array
         messages = messages[::-1]
 
-    print(f'commiting {len(messages)} messages to cache')
     await commit_messages_to_cache(messages, channel)
     return messages
 
@@ -405,4 +454,106 @@ async def reconcile_channel_links(channel: discord.TextChannel, limit: int | Non
     # Call get_messages to re-fetch messages and re-commit them to the cache, which will fix up links    
     messages = await get_messages(channel, limit=limit, before=None, after=None, progress_callback=progress_callback)
     return len(messages)
+
+async def get_channel_cache_stats(channel: discord.TextChannel) -> dict:
+    """Return basic statistics about the cached messages for a channel.
+
+    Returns a dict with keys: total, missing_previous, missing_next, earliest_id,
+    latest_id, earliest_preview, latest_preview, heads (number of messages with no previous).
+    """
+    cur = db_con.cursor()
+    try:
+        cur.execute('SELECT COUNT(*) FROM messages WHERE channel_id = ?', (channel.id,))
+        total = cur.fetchone()[0]
+
+        cur.execute('SELECT COUNT(*) FROM messages WHERE channel_id = ? AND previous_message_id IS NULL', (channel.id,))
+        missing_previous = cur.fetchone()[0]
+
+        cur.execute('SELECT COUNT(*) FROM messages WHERE channel_id = ? AND next_message_id IS NULL', (channel.id,))
+        missing_next = cur.fetchone()[0]
+
+        cur.execute('SELECT id, content FROM messages WHERE channel_id = ? ORDER BY id ASC LIMIT 1', (channel.id,))
+        row = cur.fetchone()
+        if row is None:
+            earliest_id = None
+            earliest_preview = None
+        else:
+            earliest_id = row[0]
+            earliest_preview = (row[1][:200] + '...') if row[1] and len(row[1]) > 200 else row[1]
+
+        cur.execute('SELECT id, content FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT 1', (channel.id,))
+        row = cur.fetchone()
+        if row is None:
+            latest_id = None
+            latest_preview = None
+        else:
+            latest_id = row[0]
+            latest_preview = (row[1][:200] + '...') if row[1] and len(row[1]) > 200 else row[1]
+
+        cur.execute('SELECT COUNT(*) FROM messages WHERE channel_id = ? AND previous_message_id IS NULL', (channel.id,))
+        heads = cur.fetchone()[0]
+
+        return {
+            'total': total,
+            'missing_previous': missing_previous,
+            'missing_next': missing_next,
+            'earliest_id': earliest_id,
+            'latest_id': latest_id,
+            'earliest_preview': earliest_preview,
+            'latest_preview': latest_preview,
+            'heads': heads,
+        }
+    finally:
+        cur.close()
+
+
+async def get_context_for_message(channel: discord.TextChannel, message_id: int, before: int = 3, after: int = 3):
+    """Return a list of messages (dicts) around `message_id` from the cache, ordered oldest->newest.
+
+    Each dict: id, content, author_id
+    """
+    cur = db_con.cursor()
+
+    # Walk backwards via previous_message_id
+    prev_ids = []
+    cur_id = message_id
+    for _ in range(before):
+        cur.execute('SELECT previous_message_id FROM messages WHERE id = ?', (cur_id,))
+        r = cur.fetchone()
+        if r is None or r[0] is None:
+            break
+        cur_id = r[0]
+        prev_ids.append(cur_id)
+
+    prev_ids = prev_ids[::-1]  # oldest first
+
+    # Walk forwards via next_message_id
+    next_ids = []
+    cur_id = message_id
+    for _ in range(after):
+        cur.execute('SELECT next_message_id FROM messages WHERE id = ?', (cur_id,))
+        r = cur.fetchone()
+        if r is None or r[0] is None:
+            break
+        cur_id = r[0]
+        next_ids.append(cur_id)
+
+    ids = prev_ids + [message_id] + next_ids
+    if not ids:
+        cur.close()
+        return []
+
+    placeholders = ','.join('?' for _ in ids)
+    cur.execute(f'SELECT id, content, author_id FROM messages WHERE id IN ({placeholders})', ids)
+    rows = cur.fetchall()
+    # Order rows according to ids
+    row_map = {r[0]: r for r in rows}
+    ordered = []
+    for id_ in ids:
+        r = row_map.get(id_)
+        if r is not None:
+            ordered.append({'id': r[0], 'content': r[1], 'author_id': r[2]})
+
+    cur.close()
+    return ordered
 

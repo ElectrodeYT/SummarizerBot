@@ -4,6 +4,9 @@ from pprint import pprint
 
 import discord
 from discord import app_commands
+import time
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 import summary_llm
 import cache
@@ -51,6 +54,10 @@ class DiscordClient(discord.Client):
             if message.channel is None:
                 return
         except Exception:
+            return
+
+        # Ignore ephemeral messages
+        if message.flags.ephemeral:
             return
 
         # Best-effort: commit message to cache. Do not block on failures.
@@ -124,7 +131,7 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
 @client.tree.command(description='Pre-fetch older messages and reconcile channel links in the DB')
 async def reconcile_messages(interaction: discord.Interaction, count_msgs: int = 1000,
                              channel: discord.TextChannel = None) -> None:
-    await interaction.response.send_message('Starting reconciliation, this may take a while...')
+    await interaction.response.send_message('Starting reconciliation, this may take a while...', ephemeral=True)
 
     try:
         if channel is None:
@@ -149,38 +156,134 @@ async def reconcile_messages(interaction: discord.Interaction, count_msgs: int =
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
 
-#TODO
-#@client.tree.command(description="Find a message by using a sentence as a search query. (Only searches cached messages)")
 
-async def find_message(interaction: discord.Interaction, query: str, channel: discord.TextChannel = None) -> None:
-    await interaction.response.send_message('Searching, this may take a while...', ephemeral=True)
+@client.tree.command(description='Show cache status for a channel')
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def cache_status(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
+    await interaction.response.send_message('Fetching cache status...', ephemeral=True)
 
     try:
         if channel is None:
             channel = interaction.channel
 
-        # Fetch messages from cache
-        cached_messages = await cache.get_all_messages_in_channel_from_cache(channel)
+        stats = await cache.get_channel_cache_stats(channel)
 
-        if len(cached_messages) == 0:
-            await interaction.edit_original_response(content=f'No cached messages found for channel {channel.name}')
+        embed = discord.Embed(title=f'Cache status for #{channel.name}')
+        embed.add_field(name='Total cached messages', value=str(stats['total']), inline=True)
+        embed.add_field(name='Heads (no previous)', value=str(stats['heads']), inline=True)
+        embed.add_field(name='Missing previous', value=str(stats['missing_previous']), inline=True)
+        embed.add_field(name='Missing next', value=str(stats['missing_next']), inline=True)
+        if stats['earliest_id'] is not None:
+            embed.add_field(name='Earliest ID', value=str(stats['earliest_id']), inline=False)
+            embed.add_field(name='Earliest preview', value=stats['earliest_preview'] or 'N/A', inline=False)
+        if stats['latest_id'] is not None:
+            embed.add_field(name='Latest ID', value=str(stats['latest_id']), inline=False)
+            embed.add_field(name='Latest preview', value=stats['latest_preview'] or 'N/A', inline=False)
+
+        await interaction.edit_original_response(content='', embed=embed)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
+@client.tree.command(description='Search cached messages using embeddings (does NOT hit Discord API)')
+async def search_cache(interaction: discord.Interaction, query: str, channel: discord.TextChannel = None,
+                       top_k: int = 5) -> None:
+    await interaction.response.send_message('Searching cache...', ephemeral=True)
+
+    try:
+        if channel is None:
+            channel = interaction.channel
+
+        model = 'bge-multilingual-gemma2'
+
+        # 1) Build grouped search embeddings (concatenate consecutive messages by same author)
+        # progress callback: update the interaction at most once every 3 seconds
+        last_reported = {'t': 0, 'processed': 0}
+
+        async def search_progress_cb(stage: str, processed: int, total: int):
+            now = time.time()
+            # update at most once every 3 seconds, or when finished
+            if now - last_reported['t'] >= 3 or processed == total:
+                try:
+                    await interaction.edit_original_response(content=f'{stage.replace("_", " ").capitalize()}: {processed}/{total}...')
+                    last_reported['t'] = now
+                    last_reported['processed'] = processed
+                except Exception:
+                    pass
+
+        grouped = await summary_llm.create_search_embeddings(channel, model=model, limit=5000, progress_callback=search_progress_cb)
+        if not grouped:
+            await interaction.edit_original_response(content='No cached embeddings found for this channel.')
             return
 
-        await interaction.edit_original_response(content=f'Found {len(cached_messages)} cached messages, running search...')
+        # 2) Ensure we have an embedding for the query
+        question_embedding_resp = await ai_client.embeddings.create(input=query, model=model)
+        q_emb = question_embedding_resp.data[0].embedding
 
-        # Format messages into plain text for the embeddings
-        cached_messages_text = [msg.content for msg in cached_messages if msg.content is not None and len(msg.content) > 0]
+        # 3) Compute cosine similarities
+        message_embs = [item.embedding for item in grouped if item.embedding is not None]
+        if not message_embs:
+            await interaction.edit_original_response(content='No embeddings available to search.')
+            return
 
-        # Run embeddings and find best match
-        question_embedding, message_embeddings = await summary_llm.run_embeddings(interaction, query, cached_messages_text)
+        # Compute cosine similarities in batches so we can report progress
+        q_vec = np.array(q_emb).reshape(1, -1)
+        n = len(message_embs)
+        batch_size = 256
+        sims_parts = []
+        for i in range(0, n, batch_size):
+            batch = np.stack(message_embs[i:i + batch_size])
+            part = cosine_similarity(batch, q_vec).reshape(-1)
+            sims_parts.append(part)
+            # report similarity progress
+            try:
+                await search_progress_cb('similarity', min(i + batch_size, n), n)
+            except Exception:
+                pass
 
-        best_match_index = message_embeddings.index(max(message_embeddings, key=lambda x: x[0]))
-        best_match_message = cached_messages[best_match_index]
-        best_match_score = message_embeddings[best_match_index][0] * 100
+        sims = np.concatenate(sims_parts)
 
-        embed = discord.Embed(title="Best Match", description=best_match_message)
-        embed.add_field(name="Match Score", value=f"{best_match_score:.2f}%")
-        embed.set_footer(text=f"From channel {channel.name}")
+        # 4) Pick top_k indices
+        top_idx = sims.argsort()[-top_k:][::-1]
+
+        # 5) For each result, fetch nearby context and build a snippet
+        results = []
+        for idx in top_idx:
+            item = grouped[int(idx)]
+            score = float(sims[int(idx)])
+            # pick the most recent message id in the grouped block as representative
+            rep_id = item.message_ids[-1] if item.message_ids else None
+            context = []
+            if rep_id is not None:
+                context = await cache.get_context_for_message(channel, rep_id, before=3, after=3)
+            snippet = '\n'.join([f"{c['content'][:200]}" for c in context if c.get('content')])
+            results.append((score, item, snippet))
+
+        # 6) Build embed to return (compact)
+        embed = discord.Embed(title=f'Search results for "{query}" (top {top_k})')
+        for score, item, snippet in results:
+            top_id = item.message_ids[0] if item.message_ids else None
+            # Build a Discord message jump link to the top (earliest) message in the block
+            jump_link = None
+            try:
+                guild_id = channel.guild.id
+                jump_link = f'https://discord.com/channels/{guild_id}/{channel.id}/{top_id}' if top_id is not None else None
+            except Exception:
+                jump_link = None
+
+            title = f"Score: {score:.4f} — ID: {top_id}"
+            snippet_text = (snippet or '')
+            if snippet_text and len(snippet_text) > 1000:
+                snippet_text = snippet_text[:1000] + '...'
+
+            if jump_link:
+                value = f"[Jump to top]({jump_link})\n\n{snippet_text}"
+            else:
+                value = snippet_text or ''
+
+            embed.add_field(name=title, value=value, inline=False)
 
         await interaction.edit_original_response(content='', embed=embed)
     except Exception as e:
