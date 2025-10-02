@@ -31,7 +31,8 @@ class SearchEmbedding:
 
 
 async def create_search_embeddings(channel: discord.TextChannel, model: str = 'bge-multilingual-gemma2', limit: int | None = None,
-                                   progress_callback: Optional[Callable[[str, int, int], Awaitable[None]]] = None) -> List[SearchEmbedding]:
+                                   progress_callback: Optional[Callable[[str, int, int], Awaitable[None]]] = None,
+                                   max_tokens: int = 8192) -> List[SearchEmbedding]:
     """Create search embeddings by concatenating consecutive messages from the same author.
 
     - Reads messages from cache only (uses get_all_messages_in_channel_from_cache)
@@ -100,33 +101,63 @@ async def create_search_embeddings(channel: discord.TextChannel, model: str = 'b
     need_fetch_indices = []
     results: List[SearchEmbedding] = []
 
-    # Build contexted texts: for each block, include up to 3 previous and 3 next block texts
+    # Build contexted texts: for each block, include up to `context_radius` previous and next blocks
     context_radius = 3
-    context_texts: List[str] = []
+    # Conservative char->token estimate (approx 4 chars per token)
+    max_chars = max(1, int(max_tokens * 4))
+
+    def estimate_tokens_for_text(t: str) -> int:
+        return max(1, int(len(t) / 4))
+
+    context_texts: List[Optional[str]] = []
     for i in range(len(blocks)):
-        start = max(0, i - context_radius)
-        end = min(len(blocks), i + context_radius + 1)
-        # join the block texts in context window; keep order oldest->newest
-        window_texts = [blocks[j][1] for j in range(start, end)]
-        context_text = '\n'.join(window_texts)
-        context_texts.append(context_text)
+        central = blocks[i][1]
+        # If the central block alone exceeds the limit, skip it
+        if estimate_tokens_for_text(central) > max_tokens:
+            context_texts.append(None)
+            continue
 
-    # Compute SHA1 hashes for each contexted block (same scheme as cache)
-    hashes = [hashlib.sha1(txt.encode('utf-8')).hexdigest() for txt in context_texts]
+        # Try decreasing context radius until the contexted text fits within max_tokens
+        radius = context_radius
+        chosen_text = None
+        while radius >= 0:
+            start = max(0, i - radius)
+            end = min(len(blocks), i + radius + 1)
+            window_texts = [blocks[j][1] for j in range(start, end)]
+            context_text = '\n'.join(window_texts)
+            if estimate_tokens_for_text(context_text) <= max_tokens:
+                chosen_text = context_text
+                break
+            # reduce radius (this removes context around central block first)
+            radius -= 1
 
-    # Fetch all found embeddings in a single (chunked) DB call for the contexted texts
-    cached_map = await fetch_embeddings_for_hashes(hashes, model)
+        # As a fallback, use the central block (we already checked it's <= max_tokens)
+        if chosen_text is None:
+            chosen_text = central
+
+        context_texts.append(chosen_text)
+
+    # Prepare hashes for non-skipped context_texts and fetch cached embeddings in one batch
+    hashes: List[Optional[str]] = [ (hashlib.sha1(txt.encode('utf-8')).hexdigest() if txt is not None else None) for txt in context_texts ]
+    # Only pass non-None hashes to DB helper
+    lookup_hashes = [h for h in hashes if h is not None]
+    cached_map = await fetch_embeddings_for_hashes(lookup_hashes, model) if lookup_hashes else {}
 
     cache_searched = 0
     for idx, (author, _concat, ids) in enumerate(blocks):
+        txt = context_texts[idx]
+        if txt is None:
+            # skipped due to being too large
+            continue
+
         h = hashes[idx]
-        emb = cached_map.get(h)
-        # Use the contexted text as the content associated with the embedding
-        se = SearchEmbedding(author=author, content=context_texts[idx], message_ids=ids, embedding=emb, model=model)
+        emb = cached_map.get(h) if h is not None else None
+        se = SearchEmbedding(author=author, content=txt, message_ids=ids, embedding=emb, model=model)
+        result_idx = len(results)
         results.append(se)
         if emb is None:
-            need_fetch_texts.append(context_texts[idx])
-            need_fetch_indices.append(idx)
+            need_fetch_texts.append(txt)
+            need_fetch_indices.append(result_idx)
         cache_searched += 1
         # report after checking cache in batches
         if progress_callback is not None and cache_searched % 50 == 0:

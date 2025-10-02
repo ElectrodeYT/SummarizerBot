@@ -249,6 +249,7 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
         top_idx = sims.argsort()[-top_k:][::-1]
 
         # 5) For each result, fetch nearby context and build a snippet
+        # Build initial result list with context message ids
         results = []
         for idx in top_idx:
             item = grouped[int(idx)]
@@ -258,6 +259,9 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
             context = []
             if rep_id is not None:
                 context = await cache.get_context_for_message(channel, rep_id, before=3, after=3)
+
+            # Collect context ids for deduplication
+            context_ids = set([c.get('id') for c in context if c.get('id') is not None])
 
             # Build a snippet with usernames and highlight the central message
             snippet_lines = []
@@ -278,11 +282,22 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
                     continue
 
             snippet = '\n'.join(snippet_lines)
-            results.append((score, item, snippet))
+            results.append((score, item, snippet, context_ids))
 
-        # 6) Build embed to return (compact)
+        # 6) Deduplicate overlapping results: prefer higher-scoring results and skip any whose
+        # context overlaps with an already-accepted result.
+        accepted = []
+        seen_ids = set()
+        for score, item, snippet, ctx_ids in results:
+            if ctx_ids & seen_ids:
+                # overlap with an accepted, higher-quality result -> skip
+                continue
+            accepted.append((score, item, snippet))
+            seen_ids |= ctx_ids
+
+        # 7) Build embed to return (compact)
         embed = discord.Embed(title=f'Search results for "{query}" (top {top_k})')
-        for score, item, snippet in results:
+        for score, item, snippet in accepted:
             top_id = item.message_ids[0] if item.message_ids else None
             # Build a Discord message jump link to the top (earliest) message in the block
             jump_link = None
