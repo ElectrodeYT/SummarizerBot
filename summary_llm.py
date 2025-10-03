@@ -14,12 +14,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import cProfile
 import bisect
+import asyncio
 
 # Module-level caches to avoid repeated expensive work
 # Cache for tiktoken encoders per model name
 _tiktoken_encoders: dict = {}
 # Simple in-memory token count cache: sha1(model_name + text) -> token_count
 _token_count_cache: dict = {}
+# Small in-memory cache for resolved member display names and roles across calls
+_member_cache: dict = {}
 
 def estimate_tokens(text: str, model_name: str | None = None) -> int:
     """Estimate token count for a text. Tries to use tiktoken if available, otherwise falls back to a simple heuristic (chars/4)."""
@@ -499,42 +502,117 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
 
     parts = []
     used_participant_tokens = 0
-    for uid, info in sorted_participants:
-        # attempt to resolve display name and roles
-        display_name = info.get('name', 'Unknown')
-        roles_set = set()
-        if guild is not None and uid is not None:
-            try:
-                member = guild.get_member(uid)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(uid)
-                    except Exception:
-                        member = None
-                if member is not None:
-                    display_name = getattr(member, 'display_name', display_name)
-                    try:
-                        for r in getattr(member, 'roles', []):
-                            rname = getattr(r, 'name', None)
-                            if rname and rname != '@everyone':
-                                roles_set.add(rname)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
 
-        username = info.get('name', 'Unknown')
-        count = info.get('count', 0)
-        roles = sorted(roles_set)
-        roles_str = ', '.join(roles) if roles else 'none'
-        line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
-        # Participant summary lines are part of the system content, do NOT include per-message overhead
-        tok = count_tokens(line, per_message_overhead=False)
-        if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
-            # no room for this participant line, stop adding participants
+    # Helper to fetch a single member with semaphore protection
+    async def _fetch_member_with_sem(uid: int, sem: asyncio.Semaphore):
+        async with sem:
+            try:
+                return await guild.fetch_member(uid)
+            except Exception:
+                return None
+
+    # Process participants in small chunks. For each chunk, concurrently fetch missing members
+    # with a bounded semaphore to avoid excessive concurrent requests to Discord.
+    CONCURRENCY = 8
+    CHUNK_SIZE = 32
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    # Iterate over participants in chunks (sorted by message count desc)
+    for i in range(0, len(sorted_participants), CHUNK_SIZE):
+        chunk = sorted_participants[i:i + CHUNK_SIZE]
+
+        # First, prepare which UIDs need fetching
+        to_fetch = []  # list of uids that need guild.fetch_member
+        fetch_tasks = []
+        for uid, info in chunk:
+            if uid is None:
+                continue
+            # If cached in member cache, skip
+            if uid in _member_cache:
+                continue
+            # Try local cached guild member first (non-async)
+            try:
+                member = guild.get_member(uid) if guild is not None else None
+            except Exception:
+                member = None
+            if member is not None:
+                # populate member cache
+                try:
+                    roles_set = set()
+                    for r in getattr(member, 'roles', []):
+                        rname = getattr(r, 'name', None)
+                        if rname and rname != '@everyone':
+                            roles_set.add(rname)
+                except Exception:
+                    roles_set = set()
+                _member_cache[uid] = {'display_name': getattr(member, 'display_name', info.get('name', 'Unknown')), 'roles': roles_set}
+            else:
+                to_fetch.append(uid)
+
+        # Launch concurrent fetches for this chunk, bounded by semaphore
+        if to_fetch and guild is not None:
+            for uid in to_fetch:
+                fetch_tasks.append(asyncio.create_task(_fetch_member_with_sem(uid, sem)))
+
+            # Gather results and populate cache
+            if fetch_tasks:
+                fetched_members = await asyncio.gather(*fetch_tasks)
+                for uid, member in zip(to_fetch, fetched_members):
+                    if member is None:
+                        # store a sentinel to avoid refetching repeatedly
+                        _member_cache[uid] = {'display_name': None, 'roles': set()}
+                    else:
+                        roles_set = set()
+                        try:
+                            for r in getattr(member, 'roles', []):
+                                rname = getattr(r, 'name', None)
+                                if rname and rname != '@everyone':
+                                    roles_set.add(rname)
+                        except Exception:
+                            pass
+                        _member_cache[uid] = {'display_name': getattr(member, 'display_name', None), 'roles': roles_set}
+
+        # Now process this chunk in order and add participant lines until we run out of participant token budget
+        for uid, info in chunk:
+            display_name = info.get('name', 'Unknown')
+            roles_set = set()
+            if uid in _member_cache:
+                cached = _member_cache.get(uid, {})
+                if cached.get('display_name'):
+                    display_name = cached.get('display_name')
+                roles_set = cached.get('roles', set()) or set()
+            else:
+                # fallback: try guild.get_member one last time
+                try:
+                    member = guild.get_member(uid) if guild is not None else None
+                    if member is not None:
+                        display_name = getattr(member, 'display_name', display_name)
+                        try:
+                            for r in getattr(member, 'roles', []):
+                                rname = getattr(r, 'name', None)
+                                if rname and rname != '@everyone':
+                                    roles_set.add(rname)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            username = info.get('name', 'Unknown')
+            count = info.get('count', 0)
+            roles = sorted(roles_set)
+            roles_str = ', '.join(roles) if roles else 'none'
+            line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
+            # Participant summary lines are part of the system content, do NOT include per-message overhead
+            tok = count_tokens(line, per_message_overhead=False)
+            if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
+                # no room for this participant line, stop adding participants
+                break
+            parts.append(line)
+            used_participant_tokens += tok
+
+        # If we've filled the participant token budget, break out of chunk loop early
+        if used_participant_tokens >= RESERVED_PARTICIPANT_TOKENS:
             break
-        parts.append(line)
-        used_participant_tokens += tok
 
     participants_summary = 'Major Participants:\n' + '\n'.join(parts) if parts else ''
 
