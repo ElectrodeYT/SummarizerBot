@@ -16,6 +16,23 @@ import cProfile
 import bisect
 import asyncio
 
+if 'OPENAI_API_KEY' not in os.environ or not os.environ['OPENAI_API_KEY']:
+    raise Exception('Missing OPENAI_API_KEY environment variable')
+
+if 'OPENAI_API_BASE' not in os.environ or not os.environ['OPENAI_API_BASE']:
+    raise Exception('Missing OPENAI_API_BASE environment variable')
+
+OPENAPI_TOKEN = os.environ['OPENAI_API_KEY']
+
+ai_client = AsyncOpenAI(
+    base_url=os.environ.get('OPENAI_API_BASE'),
+    api_key=OPENAPI_TOKEN
+)
+
+SUMMARIZER_MODEL = os.environ.get('SUMMARIZER_MODEL', 'google/gemini-2.5-flash-lite-preview-09-2025')
+EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-3-small')
+
+
 # Module-level caches to avoid repeated expensive work
 # Cache for tiktoken encoders per model name
 _tiktoken_encoders: dict = {}
@@ -108,13 +125,6 @@ def count_tokens(obj, model_name: str | None = None, per_message_overhead: bool 
 
     # Fallback: stringify and count
     return estimate_tokens(str(obj), model_name) + OVERHEAD_PER_MESSAGE
-
-scaleway_token = os.environ['SCW_TOKEN']
-
-ai_client = AsyncOpenAI(
-    base_url="https://api.scaleway.ai/v1",
-    api_key=scaleway_token
-)
 
 
 @dataclass
@@ -314,7 +324,7 @@ def format_message_list_for_embeddings(messages: List[discord.Message]) -> List[
     return [f"{msg.content}" for msg in messages]
  
 async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: discord.Embed):
-    model = 'mistral-small-3.2-24b-instruct-2506'
+    model = SUMMARIZER_MODEL
     temperature = 0.7
     max_tokens = 8192
 
@@ -374,7 +384,7 @@ async def fetch_and_cache_embeddings(messages: list,  model: str):
     return message_embeddings_response
 
 async def run_embeddings(interaction: discord.Interaction, base_sentence: str, messages: list):
-    model = 'bge-multilingual-gemma2'
+    model = EMBEDDING_MODEL
 
     message_embeddings = []
     message_embeddings_to_fetch = []
@@ -423,7 +433,7 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
     formatted_messages = format_message_list(discord_messages)
     # First: prepare formatted messages and cull by token budget BEFORE building participants summary.
     formatted_messages = format_message_list(discord_messages)
-    MODEL_CONTEXT_TOKENS = 126_000
+    MODEL_CONTEXT_TOKENS = 300_000
     RESERVED_RESPONSE_TOKENS = 8_192
     RESERVED_PARTICIPANT_TOKENS = 2_000
 
