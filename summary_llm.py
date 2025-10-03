@@ -12,24 +12,64 @@ from openai import AsyncOpenAI
 from pprint import pprint
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+import cProfile
+import bisect
+
+# Module-level caches to avoid repeated expensive work
+# Cache for tiktoken encoders per model name
+_tiktoken_encoders: dict = {}
+# Simple in-memory token count cache: sha1(model_name + text) -> token_count
+_token_count_cache: dict = {}
 
 def estimate_tokens(text: str, model_name: str | None = None) -> int:
     """Estimate token count for a text. Tries to use tiktoken if available, otherwise falls back to a simple heuristic (chars/4)."""
     if not text:
         return 0
+    # Use a small in-memory cache to avoid re-encoding identical texts repeatedly
+    try:
+        key = hashlib.sha1(((model_name or '') + ':' + text).encode('utf-8')).hexdigest()
+    except Exception:
+        # fallback if hashing fails for some reason
+        key = None
+
+    if key is not None and key in _token_count_cache:
+        return _token_count_cache[key]
+
+    # Try to use tiktoken if available and cache encoders per-model
     try:
         import tiktoken
-        try:
-            if model_name:
-                enc = tiktoken.encoding_for_model(model_name)
-            else:
-                enc = tiktoken.get_encoding('o200k_harmony')
-        except Exception:
-            enc = tiktoken.get_encoding('o200k_harmony')
-        return len(enc.encode(text))
+        enc = None
+        enc_key = model_name or '__default__'
+        if enc_key in _tiktoken_encoders:
+            enc = _tiktoken_encoders[enc_key]
+        else:
+            try:
+                if model_name:
+                    enc = tiktoken.encoding_for_model(model_name)
+                else:
+                    enc = tiktoken.get_encoding('o200k_harmony')
+            except Exception:
+                try:
+                    enc = tiktoken.get_encoding('o200k_harmony')
+                except Exception:
+                    enc = None
+            if enc is not None:
+                _tiktoken_encoders[enc_key] = enc
+
+        if enc is not None:
+            tok_count = len(enc.encode(text))
+            if key is not None:
+                _token_count_cache[key] = tok_count
+            return tok_count
     except Exception:
-        # conservative heuristic: 1 token per 4 characters
-        return max(1, int(len(text) / 4))
+        # tiktoken not available or failed; fall back to heuristic below
+        pass
+
+    # conservative heuristic: 1 token per 4 characters
+    tok_count = max(1, int(len(text) / 4))
+    if key is not None:
+        _token_count_cache[key] = tok_count
+    return tok_count
 
 
 def count_tokens(obj, model_name: str | None = None, per_message_overhead: bool = True) -> int:
@@ -371,80 +411,10 @@ async def run_embeddings(interaction: discord.Interaction, base_sentence: str, m
 
     return question_embeddings, message_embeddings
 
-
-async def create_summary(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
+async def _create_summary_lmm_messages(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
                          footer_text: str, show_when_context_too_large: bool = True):
-    # Build a participants summary to give the LLM additional context about who is involved
-    participants: dict = {}
-    total_msgs = len(discord_messages)
-    for m in discord_messages:
-        try:
-            author = getattr(m, 'author', None)
-            if author is None:
-                continue
-            uid = getattr(author, 'id', None)
-            name = getattr(author, 'name', 'Unknown')
-            if uid not in participants:
-                participants[uid] = {'name': name, 'count': 0}
-            participants[uid]['count'] += 1
-        except Exception:
-            continue
-
-    # Use the Discord API to fetch Member objects so we can get display_name and roles.
-    guild = getattr(interaction, 'guild', None)
-    for uid in list(participants.keys()):
-        display_name = participants[uid].get('name', 'Unknown')
-        roles_set = set()
-        if guild is not None and uid is not None:
-            try:
-                member = guild.get_member(uid)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(uid)
-                    except Exception:
-                        member = None
-                if member is not None:
-                    display_name = getattr(member, 'display_name', display_name)
-                    try:
-                        for r in getattr(member, 'roles', []):
-                            rname = getattr(r, 'name', None)
-                            if rname and rname != '@everyone':
-                                roles_set.add(rname)
-                    except Exception:
-                        pass
-            except Exception:
-                # best-effort; fall back to author name
-                pass
-
-        participants[uid]['display_name'] = display_name
-        participants[uid]['roles'] = roles_set
-
-    # If there are many messages, limit participants to those contributing >= 3%
-    parts = []
-    threshold = None
-    if total_msgs > 3000:
-        threshold = max(1, int(total_msgs * 0.03))
-
-    for uid, info in participants.items():
-        display_name = info.get('display_name', info.get('name', 'Unknown'))
-        username = info.get('name', 'Unknown')
-        count = info.get('count', 0)
-        if threshold is not None and count < threshold:
-            continue
-        roles = sorted(info.get('roles', []))
-        roles_str = ', '.join(roles) if roles else 'none'
-        line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
-        parts.append(line)
-
-    participants_summary = 'Major Participants:\n' + '\n'.join(parts) if parts else ''
-
-    system_content = (
-        f'You should summarize the following messages according to this prompt: '
-        f'"{summarize_prompt}". Use only information mentioned in the following messages.\n\n'
-        f'{participants_summary}\n\n'
-        f'If some messages do not contain any information relevant to the prompt, ignore them.\n\n'
-        f'In your response, refer to people by their display name, rather than user name, when possible.'
-    )
+    # We'll build the participants summary after truncating messages to the token budget.
+    # (Avoid expensive member resolution before truncation.)
 
     # Prepare formatted messages
     formatted_messages = format_message_list(discord_messages)
@@ -469,17 +439,36 @@ async def create_summary(interaction: discord.Interaction, discord_messages: Lis
         allowed_for_messages = 0
 
     # Count each formatted message as a separate user message (include per-message overhead)
+    # Use cached token counts where available; build an array of token counts
     msg_tokens = [count_tokens(m) for m in formatted_messages]
     total_msg_tokens = sum(msg_tokens)
     print(f'Total message tokens: {total_msg_tokens}, allowed for messages: {allowed_for_messages}')
 
     removed_count = 0
-    # Remove oldest messages until remaining message tokens fit the allowed budget for messages
-    while formatted_messages and total_msg_tokens > allowed_for_messages:
-        removed_tok = msg_tokens.pop(0)
-        formatted_messages.pop(0)
-        total_msg_tokens -= removed_tok
-        removed_count += 1
+    # Instead of popping from the front repeatedly (O(n^2)), compute prefix sums and find cutoff index.
+    if total_msg_tokens > allowed_for_messages and formatted_messages:
+        # prefix_sums[i] = total tokens of first i messages
+        prefix_sums = [0]
+        for t in msg_tokens:
+            prefix_sums.append(prefix_sums[-1] + t)
+
+        total = prefix_sums[-1]
+        # We need smallest k such that total - prefix_sums[k] <= allowed_for_messages
+        # i.e., prefix_sums[k] >= total - allowed_for_messages
+        need_at_most = total - allowed_for_messages
+        # find leftmost index where prefix_sums[idx] >= need_at_most
+        k = bisect.bisect_left(prefix_sums, need_at_most)
+        if k < 0:
+            k = 0
+        if k >= len(formatted_messages):
+            # everything would be removed; keep last message as a fallback
+            k = len(formatted_messages) - 1
+
+        # Remove the first k messages in one slice operation
+        formatted_messages = formatted_messages[k:]
+        msg_tokens = msg_tokens[k:]
+        removed_count = k
+        total_msg_tokens = sum(msg_tokens)
 
     # Note truncation in footer if messages were removed
     if removed_count > 0:
@@ -560,9 +549,18 @@ async def create_summary(interaction: discord.Interaction, discord_messages: Lis
     # Stream the summary
     embed = discord.Embed(title='Generating summary')
     embed.set_footer(text=footer_text)
+    return llm_messages, embed
 
+async def create_summary(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
+                         footer_text: str, show_when_context_too_large: bool = True):
+    #profiler = cProfile.Profile()
+    #profiler.enable()
+    llm_messages, embed = await _create_summary_lmm_messages(interaction, discord_messages, summarize_prompt,
+                                                            footer_text, show_when_context_too_large)
+    #profiler.disable()
+    #profiler.print_stats(sort='time')
     await run_llm(interaction, llm_messages, embed)
-
+    #return profiler
 
 async def create_topic_summary(interaction: discord.Interaction, discord_messages: List[discord.Message], topic: str, footer_text: str):
     llm_messages = [{'role': 'system',

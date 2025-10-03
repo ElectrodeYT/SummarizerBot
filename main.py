@@ -7,7 +7,6 @@ from discord import app_commands
 import time
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-
 import summary_llm
 import cache
 
