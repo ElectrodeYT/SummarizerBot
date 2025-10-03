@@ -267,17 +267,11 @@ def format_message_list(messages: List[discord.Message]):
     return formatted_messages
 
 
-def format_message_list_for_embeddings(messages: List[discord.Message]):
-    formatted_messages = []
-
-    for discord_message in messages:
-        formatted_messages.append(f'{discord_message.content}')
-
-    return formatted_messages
-
-
+def format_message_list_for_embeddings(messages: List[discord.Message]) -> List[str]:
+    return [f"{msg.content}" for msg in messages]
+ 
 async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: discord.Embed):
-    model = 'gpt-oss-120b'
+    model = 'mistral-small-3.2-24b-instruct-2506'
     temperature = 0.7
     max_tokens = 8192
 
