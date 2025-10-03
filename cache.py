@@ -516,6 +516,149 @@ async def reconcile_channel_links(channel: discord.TextChannel, limit: int | Non
     messages = await get_messages(channel, limit=limit, before=None, after=None, progress_callback=progress_callback)
     return len(messages)
 
+
+async def reconcile_fill_gaps_between_cached_bounds(channel: discord.TextChannel, progress_callback=None, batch_size: int = 100) -> int:
+    """Ensure there are no gaps between the earliest and latest cached messages for a channel.
+
+    This fetches messages from Discord starting at the latest cached message and walking backward
+    until it reaches the earliest cached message, committing any missing messages to the DB.
+    Returns the number of messages committed (best-effort).
+    """
+    cur = db_con.cursor()
+    try:
+        cur.execute('SELECT id, next_message_id FROM messages WHERE channel_id = ? ORDER BY id ASC', (channel.id,))
+        rows = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+    if not rows or len(rows) < 2:
+        # Nothing to reconcile (0 or 1 cached messages)
+        return 0
+
+    ids = [r[0] for r in rows]
+    next_map = {r[0]: r[1] for r in rows}
+
+    total_committed = 0
+
+    # Helper to check which of a set of ids are already cached
+    def _existing_ids(check_ids: list[int]) -> set:
+        if not check_ids:
+            return set()
+        c = db_con.cursor()
+        placeholders = ','.join('?' for _ in check_ids)
+        try:
+            c.execute(f'SELECT id FROM messages WHERE id IN ({placeholders})', check_ids)
+            found = {r[0] for r in c.fetchall()}
+        except Exception:
+            found = set()
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+        return found
+
+    # Iterate adjacent pairs to find gaps between known ids
+    for i in range(len(ids) - 1):
+        curr_id = ids[i]
+        next_id = ids[i + 1]
+
+        # If current's next pointer already points to the next id, no gap
+        if next_map.get(curr_id) == next_id:
+            continue
+
+        # There's a hole between curr_id and next_id; try to fetch the missing messages
+        collected = []
+
+        # Try fetching the later boundary message to page backwards
+        try:
+            later_msg = await channel.fetch_message(next_id)
+        except Exception:
+            later_msg = None
+
+        # Try fetching the earlier boundary message to page forwards if needed
+        try:
+            earlier_msg = await channel.fetch_message(curr_id)
+        except Exception:
+            earlier_msg = None
+
+        # If we can fetch the later message, page backwards using before=later_msg
+        if later_msg is not None:
+            before_marker = later_msg
+            safety = 0
+            while True:
+                safety += 1
+                batch = [m async for m in channel.history(limit=batch_size, before=before_marker)]
+                if not batch:
+                    break
+
+                # Keep only messages strictly between curr_id and next_id
+                to_keep = [m for m in batch if m.id > curr_id and m.id < next_id]
+                if to_keep:
+                    # filter out those already in DB
+                    existing = _existing_ids([m.id for m in to_keep])
+                    new_msgs = [m for m in to_keep if m.id not in existing]
+                    collected.extend(new_msgs)
+
+                # If oldest message in batch is older or equal to curr_id, we're done with this gap
+                if batch[-1].id <= curr_id:
+                    break
+
+                before_marker = batch[-1]
+
+                if safety > 2000:
+                    break
+
+        # Else, if we can fetch the earlier message, page forwards using after=earlier_msg
+        elif earlier_msg is not None:
+            after_marker = earlier_msg
+            safety = 0
+            while True:
+                safety += 1
+                batch = [m async for m in channel.history(limit=batch_size, after=after_marker)]
+                if not batch:
+                    break
+
+                # Keep only messages strictly between curr_id and next_id
+                to_keep = [m for m in batch if m.id > curr_id and m.id < next_id]
+                if to_keep:
+                    existing = _existing_ids([m.id for m in to_keep])
+                    new_msgs = [m for m in to_keep if m.id not in existing]
+                    collected.extend(new_msgs)
+
+                # If newest message in batch is newer or equal to next_id, done
+                if batch[0].id >= next_id:
+                    break
+
+                after_marker = batch[0]
+
+                if safety > 2000:
+                    break
+
+        # If neither boundary could be fetched, skip this gap
+        else:
+            continue
+
+        if not collected:
+            continue
+
+        # Commit collected messages (they are in newest->oldest order for history; ensure oldest->newest)
+        collected = list(reversed(collected))
+        cached_msgs = discord_messages_to_cached_messages(collected)
+        await commit_messages_to_cache(cached_msgs, channel)
+        total_committed += len(cached_msgs)
+
+        if progress_callback is not None:
+            try:
+                await progress_callback(total_committed, -1, 'committed')
+            except Exception:
+                pass
+
+    return total_committed
+
 async def get_channel_cache_stats(channel: discord.TextChannel) -> dict:
     """Return basic statistics about the cached messages for a channel.
 

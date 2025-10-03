@@ -200,6 +200,33 @@ async def reconcile_messages(interaction: discord.Interaction, count_msgs: int =
         raise
 
 
+@client.tree.command(description='Fill gaps between earliest and latest cached messages for a channel')
+async def reconcile_gaps(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
+    await interaction.response.send_message('Starting gap reconciliation, this may take a while...', ephemeral=True)
+
+    try:
+        if channel is None:
+            channel = interaction.channel
+
+        last_reported = {'processed': 0}
+
+        async def progress_cb(processed, total, type='fetched_gap'):
+            # Update periodically
+            if processed - last_reported['processed'] >= 50:
+                try:
+                    await interaction.edit_original_response(content=f'Fetched {processed} messages...')
+                    last_reported['processed'] = processed
+                except Exception:
+                    pass
+
+        processed = await cache.reconcile_fill_gaps_between_cached_bounds(channel, progress_callback=progress_cb)
+
+        await interaction.edit_original_response(content=f'Filled {processed} missing messages for channel {channel.name}')
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
 @client.tree.command(description='Show cache status for a channel')
 async def cache_status(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
     await interaction.response.send_message('Fetching cache status...', ephemeral=True)
