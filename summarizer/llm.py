@@ -173,30 +173,78 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
 
             _member_cache[uid] = {'display_name': display_name, 'roles': roles_set}
 
-        for uid, info in chunk:
-            display_name = info.get('name', 'Unknown')
-            roles_set = set()
-            if uid in _member_cache:
-                cached = _member_cache.get(uid, {})
-                if cached.get('display_name'):
-                    display_name = cached.get('display_name')
-                roles_set = cached.get('roles', set()) or set()
+    # Classify participants into major/minor if message count is large
+    total_msgs = len(formatted_messages)
+    major_candidates = []
+    minor_candidates = []
+    threshold_active = total_msgs > 3000
 
-            username = info.get('name', 'Unknown')
-            count = info.get('count', 0)
-            roles = sorted(roles_set)
-            roles_str = ', '.join(roles) if roles else 'none'
-            line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
-            tok = await count_tokens(line, model_name=MODEL, per_message_overhead=False)
-            if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
-                break
-            parts.append(line)
-            used_participant_tokens += tok
+    for uid, info in sorted_participants:
+        display_name = info.get('name', 'Unknown')
+        roles_set = set()
+        if uid in _member_cache:
+            cached = _member_cache.get(uid, {})
+            if cached.get('display_name'):
+                display_name = cached.get('display_name')
+            roles_set = cached.get('roles', set()) or set()
 
-        if used_participant_tokens >= RESERVED_PARTICIPANT_TOKENS:
+        username = info.get('name', 'Unknown')
+        count = info.get('count', 0)
+        roles = sorted(roles_set)
+        roles_str = ', '.join(roles) if roles else 'none'
+        line = f"- {display_name} (username: {username}) ({count} message{'s' if count!=1 else ''}) — roles: {roles_str}"
+
+        # Decide major vs minor when threshold_active
+        is_major = True
+        if threshold_active:
+            # participant must contribute >4% to be considered major
+            try:
+                is_major = (count / total_msgs) > 0.04
+            except Exception:
+                is_major = False
+
+        if is_major:
+            major_candidates.append((uid, line, count))
+        else:
+            minor_candidates.append((uid, line, count))
+
+    # Compute token counts for candidates (sequentially to avoid bursting async work)
+    major_entries = []
+    for uid, line, count in major_candidates:
+        tok = await count_tokens(line, model_name=MODEL, per_message_overhead=False)
+        major_entries.append((line, tok))
+
+    minor_entries = []
+    for uid, line, count in minor_candidates:
+        tok = await count_tokens(line, model_name=MODEL, per_message_overhead=False)
+        minor_entries.append((line, tok))
+
+    # Add majors first, then minors if space remains
+    major_lines = []
+    minor_lines = []
+    used_participant_tokens = 0
+    for line, tok in major_entries:
+        if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
             break
+        major_lines.append(line)
+        used_participant_tokens += tok
 
-    participants_summary = 'Major Participants:\n' + '\n'.join(parts) if parts else ''
+    # Add minor participants only if there's remaining token space
+    for line, tok in minor_entries:
+        if used_participant_tokens + tok > RESERVED_PARTICIPANT_TOKENS:
+            break
+        minor_lines.append(line)
+        used_participant_tokens += tok
+
+    participants_summary_parts = []
+    if major_lines:
+        participants_summary_parts.append('Major Participants:')
+        participants_summary_parts.append('\n'.join(major_lines))
+    if minor_lines:
+        participants_summary_parts.append('Minor Participants:')
+        participants_summary_parts.append('\n'.join(minor_lines))
+
+    participants_summary = '\n\n'.join(participants_summary_parts) if participants_summary_parts else ''
     pprint(participants_summary)
 
     system_content = system_base + '\n\n' + participants_summary if participants_summary else system_base
