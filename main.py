@@ -7,17 +7,18 @@ from discord import app_commands
 import time
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-import summary_llm
-import cache
+from summarizer.llm import create_summary, create_topic_summary
+from summarizer.embeddings import create_search_embeddings
+import summarizer.cache as cache
 
 discord_token = os.environ['DISCORD_TOKEN']
 default_summary_prompt = 'Summarize the conversation(s). If there are several conversations, summarize them individually.'
 
-scaleway_token = os.environ['SCW_TOKEN']
+OPENAPI_TOKEN = os.environ['OPENAI_API_KEY']
 
 ai_client = AsyncOpenAI(
-    base_url="https://api.scaleway.ai/v1",
-    api_key=scaleway_token
+    base_url=os.environ.get('OPENAI_API_BASE'),
+    api_key=OPENAPI_TOKEN
 )
 
 
@@ -103,6 +104,7 @@ class DiscordClient(discord.Client):
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = DiscordClient(intents=intents)
 
 
@@ -132,11 +134,11 @@ async def summarize(interaction: discord.Interaction, count_msgs: int | None = N
         if count_msgs is None:
             discord_messages = await cache.get_all_messages_in_channel_from_cache(channel)
         else:
-            discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
+            discord_messages = await cache.get_messages(channel=channel, limit=count_msgs)
         footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}'
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-        await summary_llm.create_summary(interaction, discord_messages, summarize_prompt, footer_text)
+        await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
@@ -159,12 +161,12 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
         if count_msgs is None:
             discord_messages = await cache.get_all_messages_in_channel_from_cache(channel)
         else:
-            discord_messages = await summary_llm.get_messages(channel=channel, limit=count_msgs)
+            discord_messages = await cache.get_messages(channel=channel, limit=count_msgs)
 
         footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Topic: {topic}'
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-        await summary_llm.create_topic_summary(interaction, discord_messages, topic, footer_text)
+        await create_topic_summary(interaction, discord_messages, topic, footer_text)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
@@ -280,7 +282,7 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
                 except Exception:
                     pass
 
-        grouped = await summary_llm.create_search_embeddings(channel, model=model, limit=5000, progress_callback=search_progress_cb)
+        grouped = await create_search_embeddings(channel, model=model, limit=5000, progress_callback=search_progress_cb)
         if not grouped:
             await interaction.edit_original_response(content='No cached embeddings found for this channel.')
             return

@@ -22,6 +22,9 @@ db_con.execute('CREATE TABLE IF NOT EXISTS authors(id INT PRIMARY KEY, name TEXT
 db_con.execute('CREATE TABLE IF NOT EXISTS messages(id PRIMARY KEY, content TEXT, author_id INT, channel_id INT,'
                'previous_message_id INT, next_message_id INT)')
 db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding BLOB, model TEXT, UNIQUE(hash, model))')
+# Store precomputed token counts for text hashes per model/encoding to avoid repeated tokenization
+db_con.execute('CREATE TABLE IF NOT EXISTS token_counts(hash TEXT, model TEXT, token_count INT, '
+               'UNIQUE(hash, model))')
 
 # Create helpful indices for faster lookups
 try:
@@ -282,6 +285,53 @@ async def commit_embedding_to_cache(message: CachedDiscordMessage | discord.Mess
     cur.execute('INSERT OR REPLACE INTO embeddings(hash, embedding, model) VALUES (?, ?, ?)', (hash, blob, used_model))
     cur.close()
     db_con.commit()
+
+
+async def fetch_token_count_from_cache(text: str, model: str) -> int | None:
+    """Lookup a token count for the given text and model from the token_counts table."""
+    try:
+        import hashlib as _hashlib
+        h = _hashlib.sha1(text.encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+    cur = db_con.cursor()
+    try:
+        cur.execute('SELECT token_count FROM token_counts WHERE hash = ? AND model = ?', (h, model))
+        row = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+    if row is None:
+        return None
+    return int(row[0])
+
+
+async def commit_token_count_to_cache(text: str, model: str, token_count: int):
+    try:
+        import hashlib as _hashlib
+        h = _hashlib.sha1(text.encode('utf-8')).hexdigest()
+    except Exception:
+        return
+
+    cur = db_con.cursor()
+    try:
+        cur.execute('INSERT OR REPLACE INTO token_counts(hash, model, token_count) VALUES (?, ?, ?)', (h, model, int(token_count)))
+        db_con.commit()
+    except Exception:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 def discord_author_to_cached_author(author: discord.User):
@@ -760,4 +810,3 @@ async def get_context_for_message(channel: discord.TextChannel, message_id: int,
 
     cur.close()
     return ordered
-

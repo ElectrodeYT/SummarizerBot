@@ -3,3 +3,6 @@ data/
 .github
 *venv*
 .env
+.vscode
+__pycache__
+*.pyc
