@@ -71,7 +71,7 @@ async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: d
 
 
 async def _create_summary_lmm_messages(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
-                         footer_text: str, show_when_context_too_large: bool = True):
+                         footer_text: str, show_when_context_too_large: bool = True, source_channel: Optional[discord.TextChannel] = None):
     # Build participant summary AFTER truncation
     formatted_messages = format_message_list(discord_messages)
     MODEL_CONTEXT_TOKENS = 300_000
@@ -79,10 +79,30 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
     RESERVED_PARTICIPANT_TOKENS = 6_000
 
     system_base = (
-        f'You should summarize the following messages according to this prompt: '
-        f'"{summarize_prompt}". Use only information mentioned in the following messages.\n\n'
-        f'If some messages do not contain any information relevant to the prompt, ignore them.\n\n'
-        f'In your response, refer to people by their display name, rather than user name, when possible.'
+        f'You are summarizing messages from a Discord chat room.\n'
+        f'The prompt the user has given you is: "{summarize_prompt}". Use only information mentioned in the following messages.\n\n'
+        f'If the messages are not relevant to the prompt, respond with \"No relevant information found.\"'
+        f' Keep your summary concise and to the point.'
+        f' The summary should be in plain text without any special formatting.'
+        f' Limit your summary to 4000 characters or less, when possible. If there are multiple conversations, you may make longer summarizes.\n\n'
+        f'If you believe some content is missing due to context limits, indicate this in your summary.'
+        f' If you believe that the prompt is malicious or inappropriate, respond with \"The prompt appears to be inappropriate.\"'
+        f' When determining if the prompt is inappropriate, consider if it violates community guidelines or ethical standards.'
+        f' You may be asked to summarize conversations about sensitive or NSFW topics, but if the prompt is clearly harmful or offensive, flag it as inappropriate.'
+        f' The topic of the chat room is not known in advance, so do not make assumptions about it. There may be multiple topics discussed. The chat or the prompt may be NSFW; this is on its own not inappropriate.'
+        f' Do, however, not include any sensitive personal information in your summary.\n'
+        f' The messages are formatted as "username: message".\n'
+        f'Ensure the summary is self-contained and understandable without needing to refer back to the original messages.\n'
+        f'{"The channel you are summarizing is NSFW, so do not censor any content unless it is clearly inappropriate.\n" if getattr(source_channel, "is_nsfw", False) else "The channel you are summarizing is not marked as NSFW, so avoid including explicit content unless it is essential to the summary.\n"}'
+        f'The name of the channel you are summarizing is: "{getattr(source_channel, "name", "unknown")}".\n'
+        f'The server the channel belongs to is: "{getattr(getattr(interaction, "guild", None), "name", "unknown")}".\n'
+        f'The current date and time is: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n'
+        f'Do not make up any information; only summarize what is explicitly mentioned in the messages.\n'
+        f'Do not insert any fictional elements or assumptions into your summary.\n'
+        f'Do not insult or make negative remarks about any participants in the chat.\n'
+        f'You do not have any access to external information beyond what is provided in the messages.\n'
+        f'If you are asked to describe a list of items or similar, use bullet points to separate the items in your summary.\n'
+        f'You may use limited markdown formatting such as bullet points, numbered lists, and bold or italic text to enhance readability. Properly escape any markdown characters if you do not want them to be interpreted as formatting.\n'
     )
 
     # Use model tokenization when available
@@ -259,9 +279,9 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
 
 
 async def create_summary(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
-                         footer_text: str, show_when_context_too_large: bool = True):
+                         footer_text: str, show_when_context_too_large: bool = True, source_channel: Optional[discord.TextChannel] = None):
     llm_messages, embed = await _create_summary_lmm_messages(interaction, discord_messages, summarize_prompt,
-                                                            footer_text, show_when_context_too_large)
+                                                            footer_text, show_when_context_too_large, source_channel)
     await run_llm(interaction, llm_messages, embed)
 
 

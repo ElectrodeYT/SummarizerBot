@@ -138,7 +138,7 @@ async def summarize(interaction: discord.Interaction, count_msgs: int | None = N
         footer_text = f'Summary of the last {len(discord_messages)} messages in {channel.name} | Summary prompt: {summarize_prompt}'
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-        await create_summary(interaction, discord_messages, summarize_prompt, footer_text)
+        await create_summary(interaction, discord_messages, summarize_prompt, footer_text, source_channel=channel)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
