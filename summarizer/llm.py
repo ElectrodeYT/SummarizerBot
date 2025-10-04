@@ -125,17 +125,7 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
         f'You may use limited markdown formatting such as bullet points, numbered lists, and bold or italic text to enhance readability. Properly escape any markdown characters if you do not want them to be interpreted as formatting.\n'
     )
 
-    # If there are ignored users, explicitly instruct model not to mention them by name
-    try:
-        ignored_rows = await list_ignored_users(guild_id)
-        ignored_names = [r.get('name') for r in ignored_rows if r.get('name')]
-    except Exception:
-        ignored_names = []
-
-    if ignored_names:
-        # create a clear instruction
-        names_list = ', '.join(ignored_names)
-        system_base += f"\nImportant: The following user(s) are on the server's ignore list and must not be shown to you or mentioned in any way: {names_list}. Do NOT include or reference these users in the summary. If the prompt mentions any of these users, you MUST reject the prompt as inappropriate.\n"
+    # (Ignored users instruction will be appended later after we resolve display names)
 
     # Use model tokenization when available
     MODEL = SUMMARIZER_MODEL
@@ -297,6 +287,68 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
 
     participants_summary = '\n\n'.join(participants_summary_parts) if participants_summary_parts else ''
     pprint(participants_summary)
+
+    # Resolve ignored users now that we have display name resolutions available in _member_cache
+    try:
+        ignored_rows = await list_ignored_users(guild_id)
+    except Exception:
+        ignored_rows = []
+
+    ignored_descriptions = []
+    # Try to resolve the ignored user's current member/user from Discord (cache-only) so we don't rely on possibly stale DB names.
+    client = getattr(interaction, 'client', None) or getattr(interaction, 'bot', None)
+    for r in ignored_rows:
+        try:
+            uid = r.get('user_id')
+            db_name = r.get('name') or 'unknown'
+
+            display = None
+            username = None
+
+            # Prefer guild member (has display_name)
+            try:
+                member = guild.get_member(uid) if guild is not None else None
+            except Exception:
+                member = None
+
+            if member is not None:
+                try:
+                    display = getattr(member, 'display_name', None)
+                except Exception:
+                    display = None
+                try:
+                    username = getattr(member, 'name', None)
+                except Exception:
+                    username = None
+
+            # If not a guild member, try client cache for a user object (no network call)
+            if member is None and client is not None:
+                try:
+                    user = client.get_user(uid)
+                except Exception:
+                    user = None
+                if user is not None:
+                    try:
+                        username = getattr(user, 'name', None) or username
+                    except Exception:
+                        pass
+
+            # Final fallbacks
+            username = username or db_name or 'unknown'
+            if display and display != username:
+                ignored_descriptions.append(f"{display} (username: {username})")
+            else:
+                ignored_descriptions.append(f"{username}")
+        except Exception:
+            # On any error, fall back to DB name
+            try:
+                ignored_descriptions.append(r.get('name') or 'unknown')
+            except Exception:
+                continue
+
+    if ignored_descriptions:
+        names_list = ', '.join(ignored_descriptions)
+        system_base += f"\nImportant: The following user(s) are on the server's ignore list and must not be shown to you or mentioned in any way: {names_list}. Do NOT include or reference these users in the summary. If the prompt mentions any of these users, you MUST reject the prompt as inappropriate.\n"
 
     system_content = system_base + '\n\n' + participants_summary if participants_summary else system_base
 
