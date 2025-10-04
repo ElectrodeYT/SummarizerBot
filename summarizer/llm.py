@@ -76,7 +76,7 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
     formatted_messages = format_message_list(discord_messages)
     MODEL_CONTEXT_TOKENS = 300_000
     RESERVED_RESPONSE_TOKENS = 8_192
-    RESERVED_PARTICIPANT_TOKENS = 2_000
+    RESERVED_PARTICIPANT_TOKENS = 6_000
 
     system_base = (
         f'You should summarize the following messages according to this prompt: '
