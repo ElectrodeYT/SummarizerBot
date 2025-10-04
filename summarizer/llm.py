@@ -11,6 +11,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from summarizer.config import ai_client, SUMMARIZER_MODEL, EMBEDDING_MODEL
 from summarizer.token_utils import estimate_tokens, count_tokens
 from summarizer.cache import *
+from summarizer.cache import is_user_ignored, list_ignored_users
 from summarizer.embeddings import run_embeddings
 
 
@@ -35,11 +36,13 @@ async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: d
         messages=llm_messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        stream=True
+        stream=True,
+        reasoning_effort="medium"
     )
 
     embed.add_field(name='LLM Info', value=f'Model: {model}, Max Tokens: {max_tokens}, '
                                            f'Temperature: {temperature}')
+    embed.title = 'LLM is reasoning...'
 
     last_edit = None
     summary = ''
@@ -72,8 +75,25 @@ async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: d
 
 async def _create_summary_lmm_messages(interaction: discord.Interaction, discord_messages: List[discord.Message], summarize_prompt: str,
                          footer_text: str, show_when_context_too_large: bool = True, source_channel: Optional[discord.TextChannel] = None):
+    # Filter out messages from ignored users (guild-specific or global)
+    filtered_messages = []
+    guild_id = getattr(getattr(interaction, 'guild', None), 'id', None)
+    for m in discord_messages:
+        try:
+            uid = getattr(getattr(m, 'author', None), 'id', None)
+        except Exception:
+            uid = None
+        try:
+            if uid is not None and await is_user_ignored(uid, guild_id):
+                # skip messages from ignored users
+                continue
+        except Exception:
+            # on error, keep the message to avoid data loss
+            pass
+        filtered_messages.append(m)
+
     # Build participant summary AFTER truncation
-    formatted_messages = format_message_list(discord_messages)
+    formatted_messages = format_message_list(filtered_messages)
     MODEL_CONTEXT_TOKENS = 300_000
     RESERVED_RESPONSE_TOKENS = 8_192
     RESERVED_PARTICIPANT_TOKENS = 6_000
@@ -104,6 +124,18 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
         f'If you are asked to describe a list of items or similar, use bullet points to separate the items in your summary.\n'
         f'You may use limited markdown formatting such as bullet points, numbered lists, and bold or italic text to enhance readability. Properly escape any markdown characters if you do not want them to be interpreted as formatting.\n'
     )
+
+    # If there are ignored users, explicitly instruct model not to mention them by name
+    try:
+        ignored_rows = await list_ignored_users(guild_id)
+        ignored_names = [r.get('name') for r in ignored_rows if r.get('name')]
+    except Exception:
+        ignored_names = []
+
+    if ignored_names:
+        # create a clear instruction
+        names_list = ', '.join(ignored_names)
+        system_base += f"\nImportant: The following user(s) are on the server's ignore list and must not be shown to you or mentioned in any way: {names_list}. Do NOT include or reference these users in the summary. If the prompt mentions any of these users, you MUST reject the prompt as inappropriate.\n"
 
     # Use model tokenization when available
     MODEL = SUMMARIZER_MODEL
@@ -140,7 +172,7 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
     if removed_count > 0:
         footer_text = footer_text + f'\n\nNote: {removed_count} earlier message(s) were omitted to fit the model context.'
 
-    truncated_discord_messages = discord_messages[-len(formatted_messages):] if formatted_messages else []
+    truncated_discord_messages = filtered_messages[-len(formatted_messages):] if formatted_messages else []
 
     participants: dict = {}
     for m in truncated_discord_messages:
@@ -159,7 +191,6 @@ async def _create_summary_lmm_messages(interaction: discord.Interaction, discord
     guild = getattr(interaction, 'guild', None)
     sorted_participants = sorted(participants.items(), key=lambda kv: kv[1].get('count', 0), reverse=True)
 
-    parts = []
     used_participant_tokens = 0
 
     # Resolve display names and roles using guild.get_member (local cache). Avoid fetch_member network calls.

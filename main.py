@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from summarizer.llm import create_summary, create_topic_summary
 from summarizer.embeddings import create_search_embeddings
 import summarizer.cache as cache
+from summarizer.cache import add_ignored_user, remove_ignored_user, list_ignored_users
 
 discord_token = os.environ['DISCORD_TOKEN']
 default_summary_prompt = 'Summarize the conversation(s). If there are several conversations, summarize them individually.'
@@ -139,6 +140,133 @@ async def summarize(interaction: discord.Interaction, count_msgs: int | None = N
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
         await create_summary(interaction, discord_messages, summarize_prompt, footer_text, source_channel=channel)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
+@client.tree.command(description='Add a user to the ignore list for this guild')
+async def ignore_user(interaction: discord.Interaction, user: discord.User) -> None:
+    await interaction.response.send_message('Updating ignore list...', ephemeral=True)
+    try:
+        # Only allow adding other users if the invoking user is a server admin. Users may ignore themselves.
+        def _is_invoker_admin():
+            guild = getattr(interaction, 'guild', None)
+            if guild is None:
+                return False
+            try:
+                member = guild.get_member(interaction.user.id)
+            except Exception:
+                member = None
+            if member is None:
+                return False
+            try:
+                if getattr(guild, 'owner_id', None) == member.id:
+                    return True
+                perms = getattr(member, 'guild_permissions', None)
+                if perms is not None and (perms.administrator or perms.manage_guild):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        guild = getattr(interaction, 'guild', None)
+        guild_id = getattr(guild, 'id', None)
+        # If target is not the invoker, enforce admin-only
+        if user.id != interaction.user.id and not _is_invoker_admin():
+            await interaction.edit_original_response(content="You don't have permission to ignore other users; you may only ignore yourself.")
+            return
+
+        await cache.add_ignored_user(user.id, guild_id, getattr(user, 'name', None))
+        await interaction.edit_original_response(content=f'User {user.name} ({user.id}) added to ignore list for this server.')
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
+@client.tree.command(description='Remove a user from the ignore list for this guild')
+async def unignore_user(interaction: discord.Interaction, user: discord.User) -> None:
+    await interaction.response.send_message('Updating ignore list...', ephemeral=True)
+    try:
+        # Only allow removing other users if the invoking user is a server admin. Users may unignore themselves.
+        def _is_invoker_admin():
+            guild = getattr(interaction, 'guild', None)
+            if guild is None:
+                return False
+            try:
+                member = guild.get_member(interaction.user.id)
+            except Exception:
+                member = None
+            if member is None:
+                return False
+            try:
+                if getattr(guild, 'owner_id', None) == member.id:
+                    return True
+                perms = getattr(member, 'guild_permissions', None)
+                if perms is not None and (perms.administrator or perms.manage_guild):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        guild = getattr(interaction, 'guild', None)
+        guild_id = getattr(guild, 'id', None)
+        if user.id != interaction.user.id and not _is_invoker_admin():
+            await interaction.edit_original_response(content="You don't have permission to unignore other users; you may only unignore yourself.")
+            return
+
+        removed = await cache.remove_ignored_user(user.id, guild_id)
+        if removed:
+            await interaction.edit_original_response(content=f'User {user.name} ({user.id}) removed from ignore list for this server.')
+        else:
+            await interaction.edit_original_response(content=f'User {user.name} ({user.id}) was not in the ignore list for this server.')
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
+@client.tree.command(description='List users on the ignore list for this guild (and global entries)')
+async def list_ignored(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message('Fetching ignore list...', ephemeral=True)
+    try:
+        # Only server admins may view the server ignore list
+        guild = getattr(interaction, 'guild', None)
+        guild_id = getattr(guild, 'id', None)
+
+        def _is_invoker_admin():
+            if guild is None:
+                return False
+            try:
+                member = guild.get_member(interaction.user.id)
+            except Exception:
+                member = None
+            if member is None:
+                return False
+            try:
+                if getattr(guild, 'owner_id', None) == member.id:
+                    return True
+                perms = getattr(member, 'guild_permissions', None)
+                if perms is not None and (perms.administrator or perms.manage_guild):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        if not _is_invoker_admin():
+            await interaction.edit_original_response(content="You don't have permission to view the server's ignore list.")
+            return
+
+        rows = await cache.list_ignored_users(guild_id)
+        if not rows:
+            await interaction.edit_original_response(content='No ignored users for this server.')
+            return
+        lines = []
+        for r in rows:
+            g = r.get('guild_id')
+            scope = 'Global' if g is None else 'Server'
+            name = r.get('name') or 'Unknown'
+            lines.append(f"{name} ({r.get('user_id')}) — {scope}")
+        await interaction.edit_original_response(content='\n'.join(lines))
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise

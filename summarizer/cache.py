@@ -26,6 +26,14 @@ db_con.execute('CREATE TABLE IF NOT EXISTS embeddings(hash INT, embedding BLOB, 
 db_con.execute('CREATE TABLE IF NOT EXISTS token_counts(hash TEXT, model TEXT, token_count INT, '
                'UNIQUE(hash, model))')
 
+# Per-guild (or global when guild_id IS NULL) list of ignored users. When a user is ignored,
+# the LLM must not be shown messages from that user and should not mention them in prompts.
+try:
+    db_con.execute('CREATE TABLE IF NOT EXISTS ignored_users(user_id INT, guild_id INT, name TEXT, '
+                   'UNIQUE(user_id, guild_id))')
+except Exception:
+    pass
+
 # Create helpful indices for faster lookups
 try:
     db_con.execute('CREATE INDEX IF NOT EXISTS idx_messages_next ON messages(next_message_id)')
@@ -346,6 +354,67 @@ def discord_messages_to_cached_messages(discord_messages: list[discord.Message])
                                                    channel_id=discord_message.channel.id))
 
     return messages
+
+
+async def add_ignored_user(user_id: int, guild_id: int | None = None, name: str | None = None):
+    """Mark a user as ignored for a guild (guild_id may be None for global)."""
+    cur = db_con.cursor()
+    try:
+        cur.execute('INSERT OR REPLACE INTO ignored_users(user_id, guild_id, name) VALUES (?, ?, ?)',
+                    (user_id, guild_id, name))
+        db_con.commit()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+async def remove_ignored_user(user_id: int, guild_id: int | None = None) -> bool:
+    """Remove an ignored user entry. Returns True if any row deleted."""
+    cur = db_con.cursor()
+    try:
+        cur.execute('DELETE FROM ignored_users WHERE user_id = ? AND (guild_id IS ? OR guild_id = ?)',
+                    (user_id, guild_id, guild_id))
+        deleted = cur.rowcount
+        db_con.commit()
+        return deleted > 0
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+async def list_ignored_users(guild_id: int | None = None) -> list[dict]:
+    """Return a list of ignored users for a given guild (or global if guild_id is None)."""
+    cur = db_con.cursor()
+    try:
+        if guild_id is None:
+            cur.execute('SELECT user_id, guild_id, name FROM ignored_users WHERE guild_id IS NULL')
+        else:
+            cur.execute('SELECT user_id, guild_id, name FROM ignored_users WHERE guild_id = ? OR guild_id IS NULL', (guild_id,))
+        rows = cur.fetchall()
+        return [{'user_id': r[0], 'guild_id': r[1], 'name': r[2]} for r in rows]
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+async def is_user_ignored(user_id: int, guild_id: int | None = None) -> bool:
+    """Return True if user is ignored for the guild or globally."""
+    cur = db_con.cursor()
+    try:
+        cur.execute('SELECT 1 FROM ignored_users WHERE user_id = ? AND (guild_id = ? OR guild_id IS NULL) LIMIT 1',
+                    (user_id, guild_id))
+        return cur.fetchone() is not None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 async def get_messages_from_discord(channel: discord.TextChannel, limit=50, before=None, after=None):
     print(f'Fetching {limit} messages from discord directly (limit={limit}, before={before}, after={after})')
