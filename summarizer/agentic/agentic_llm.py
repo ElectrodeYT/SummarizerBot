@@ -177,6 +177,35 @@ def _resolve_text_channel(ctx: DiscordAgenticContext, channel_id: Any, *, tool_n
     return None
 
 
+def _resolve_member_by_username(ctx: DiscordAgenticContext, username: str, *, tool_name: str) -> discord.Member | None:
+    query = (username or '').strip()
+    if not query:
+        _log_tool_call(ctx, f'{tool_name}(username={username!r}) -> Error: empty username')
+        return None
+
+    direct = next((m for m in ctx.guild.members if getattr(m, 'name', None) == query), None)
+    if direct is not None:
+        return direct
+
+    lowered = query.lower()
+    exact_ci = next((m for m in ctx.guild.members if str(getattr(m, 'name', '')).lower() == lowered), None)
+    if exact_ci is not None:
+        return exact_ci
+
+    partial = [m for m in ctx.guild.members if lowered in str(getattr(m, 'name', '')).lower()]
+    if len(partial) == 1:
+        return partial[0]
+
+    if len(partial) > 1:
+        candidates = ', '.join(f'{m.name} ({m.id})' for m in partial[:5])
+        suffix = ' …' if len(partial) > 5 else ''
+        _log_tool_call(ctx, f'{tool_name}(username={username!r}) -> Ambiguous username; matches: {candidates}{suffix}')
+        return None
+
+    _log_tool_call(ctx, f'{tool_name}(username={username!r}) -> Username not found in guild members')
+    return None
+
+
 def _extract_tool_call_name_and_args(item: Any) -> tuple[str, str | None]:
     candidates: list[Any] = [item]
     raw_item = _get_attr_or_key(item, 'raw_item', None)
@@ -698,15 +727,15 @@ async def get_server_information(ctx: RunContextWrapper[DiscordAgenticContext]) 
 
 
 @function_tool
-async def get_user_information(ctx: RunContextWrapper[DiscordAgenticContext], user_id: int) -> str:
-    """Get information about a specific user in the guild."""
+async def get_user_information(ctx: RunContextWrapper[DiscordAgenticContext], username: str) -> str:
+    """Get information about a specific user in the guild by username."""
     guild = ctx.context.guild
-    member = guild.get_member(user_id)
+    member = _resolve_member_by_username(ctx.context, username, tool_name='get_user_information')
     ignored_user_ids = await _ignored_user_id_set(guild.id)
-    is_ignored = user_id in ignored_user_ids
+    is_ignored = member.id in ignored_user_ids if member is not None else False
 
     if member is None:
-        result = f'User ID: {user_id}\nStatus: not a current guild member\nIgnored: {is_ignored}'
+        result = f'Username query: {username}\nStatus: not a current guild member\nIgnored: unknown'
     else:
         role_names = [r.name for r in getattr(member, 'roles', []) if getattr(r, 'name', None) and r.name != '@everyone']
         result = (
@@ -720,30 +749,38 @@ async def get_user_information(ctx: RunContextWrapper[DiscordAgenticContext], us
             f'Ignored: {is_ignored}'
         )
 
-    _log_tool_call(ctx.context, f'get_user_information(user_id={user_id}) -> {"member" if member is not None else "unknown user"}')
+    _log_tool_call(ctx.context, f'get_user_information(username={username!r}) -> {"member" if member is not None else "unknown user"}')
     return result
 
 
 @function_tool
-async def fetch_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext], channel_id: int, user_id: int, limit: int = 100) -> list[str]:
-    """Fetch cached or recently loaded messages from a specific user in a channel."""
+async def fetch_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext], channel_id: int, username: str, limit: int = 100) -> list[str]:
+    """Fetch cached or recently loaded messages from a specific username in a channel."""
     channel = _resolve_text_channel(ctx.context, channel_id, tool_name='fetch_messages_by_user')
     if channel is None:
         return []
 
+    member = _resolve_member_by_username(ctx.context, username, tool_name='fetch_messages_by_user')
+    if member is None:
+        return []
+
     cached_msgs = await _get_cached_messages_for_channel(ctx.context, channel, fetch_if_missing=True, fetch_limit=max(limit, 100))
-    filtered = [m for m in cached_msgs if getattr(getattr(m, 'author', None), 'id', None) == user_id]
+    filtered = [m for m in cached_msgs if getattr(getattr(m, 'author', None), 'id', None) == member.id]
     filtered = sorted(filtered, key=lambda m: m.id)
     result = [_format_msg_compact(msg) for msg in filtered[-limit:] if msg.content]
-    _log_tool_call(ctx.context, f'fetch_messages_by_user(channel_id={channel_id}, user_id={user_id}, limit={limit}) -> {len(result)} messages')
+    _log_tool_call(ctx.context, f'fetch_messages_by_user(channel_id={channel_id}, username={member.name!r}, limit={limit}) -> {len(result)} messages')
     return result
 
 
 @function_tool
-async def search_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext], channel_id: int, user_id: int, query: str, max_results: int = 20, max_tokens: int = 1000) -> list[str]:
-    """Search cached or recently loaded messages from a specific user in a channel."""
+async def search_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext], channel_id: int, username: str, query: str, max_results: int = 20, max_tokens: int = 1000) -> list[str]:
+    """Search cached or recently loaded messages from a specific username in a channel."""
     channel = _resolve_text_channel(ctx.context, channel_id, tool_name='search_messages_by_user')
     if channel is None:
+        return []
+
+    member = _resolve_member_by_username(ctx.context, username, tool_name='search_messages_by_user')
+    if member is None:
         return []
 
     cached_msgs = await _get_cached_messages_for_channel(ctx.context, channel, fetch_if_missing=True, fetch_limit=max(max_results * 2, 100))
@@ -751,7 +788,7 @@ async def search_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext],
     total_tokens = 0
     for msg in cached_msgs:
         author_id = getattr(getattr(msg, 'author', None), 'id', None)
-        if author_id != user_id:
+        if author_id != member.id:
             continue
         content = getattr(msg, 'content', '') or ''
         if query.lower() not in content.lower():
@@ -765,7 +802,7 @@ async def search_messages_by_user(ctx: RunContextWrapper[DiscordAgenticContext],
             break
 
     result = [_format_msg_compact(msg) for msg in matched if msg.content]
-    _log_tool_call(ctx.context, f'search_messages_by_user(channel_id={channel_id}, user_id={user_id}, query={query!r}, max_results={max_results}, max_tokens={max_tokens}) -> {len(result)} messages')
+    _log_tool_call(ctx.context, f'search_messages_by_user(channel_id={channel_id}, username={member.name!r}, query={query!r}, max_results={max_results}, max_tokens={max_tokens}) -> {len(result)} messages')
     return result
 
 class IgnoredUsersGuardrailOutput(BaseModel):
@@ -800,16 +837,16 @@ agent = Agent(
     "The tools you have access to are as follows:\n" \
     "- get_ignored_users(): Get the list of ignored users in the guild. You should use this to filter out any messages from these users when summarizing.\n" \
     "- get_channel_list(): Get the list of text channels in the guild. Use this to determine which channels to summarize from.\n" \
-    "- get_user_information(user_id): Get information about a specific user. Use this when a summary depends on who a user is.\n" \
+    "- get_user_information(username): Get information about a specific user by username. Use this when a summary depends on who a user is.\n" \
     "- fetch_recent_messages_in_channel(channel_id, limit=100): Fetch the newest messages from a channel. Use this first when you need to inspect a channel.\n" \
     "- fetch_messages_older_than(channel_id, before_message_id, limit=100): Fetch older messages before a known message ID. Use this to page backwards through the channel.\n" \
-    "- fetch_messages_by_user(channel_id, user_id, limit=100): Fetch cached or recently loaded messages from a specific user in a channel.\n" \
-    "- search_messages_by_user(channel_id, user_id, query, max_results=20, max_tokens=1000): Search cached or recently loaded messages from a specific user.\n" \
+    "- fetch_messages_by_user(channel_id, username, limit=100): Fetch cached or recently loaded messages from a specific username in a channel.\n" \
+    "- search_messages_by_user(channel_id, username, query, max_results=20, max_tokens=1000): Search cached or recently loaded messages from a specific username.\n" \
     "- get_messages_in_channel(channel_id, limit=50, skip=0): Get a slice of messages from the cached/loaded channel history.\n" \
     "- search_messages_in_channel(channel_id, query, max_results=20, max_tokens=1000): Search cached/loaded messages in a specific channel by simple substring matching.\n" \
     "- get_context_around_message(channel_id, message_id, radius=5, max_tokens=1000): Get the context around a specific message by ID in a specific channel by ID.\n" \
     "- get_server_information(): Get basic information about the server.\n" \
-    "When summarizing, ensure that you do not include any information from ignored users. If the user prompt is vague, use the server information and channel list to determine the most relevant channels to summarize from. " \
+    "When summarizing, ensure that you do not include any information from ignored users. Prefer usernames over user IDs when selecting user-focused tools. If the user prompt is vague, use the server information and channel list to determine the most relevant channels to summarize from. " \
     "If a channel appears empty from cache, fetch recent messages from it first, then page older messages if needed. Prefer exact message retrieval before searching. Always aim to provide a concise and informative summary that captures the key points of the conversation.",
     model=AGENTIC_SUMMARIZER_MODEL,
     input_guardrails=[ignored_users_input_guardrail],
