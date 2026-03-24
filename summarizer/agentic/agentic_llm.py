@@ -23,6 +23,7 @@ import discord
 from dataclasses import dataclass, field
 import io
 import asyncio
+import re
 from datetime import datetime
 from collections import defaultdict
 from typing import Any, cast
@@ -98,19 +99,37 @@ def _coerce_text(obj: Any) -> str:
         return ''
     if isinstance(obj, str):
         return obj
+    if isinstance(obj, (list, tuple, set)):
+        parts: list[str] = []
+        for raw_part in cast(Any, obj):
+            part = _coerce_text(raw_part).strip()
+            if part:
+                parts.append(part)
+        return ' | '.join(parts)
     if isinstance(obj, dict):
         for key in ('content', 'text', 'summary', 'message'):
             value = obj.get(key)
             if value:
-                return str(value)
+                return _coerce_text(value)
         return str(obj)
+
+    model_dump = getattr(obj, 'model_dump', None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            text = _coerce_text(dumped)
+            if text:
+                return text
+        except Exception:
+            pass
+
     for attr in ('content', 'text', 'summary'):
         try:
             value = getattr(obj, attr, None)
         except Exception:
             value = None
         if value:
-            return str(value)
+            return _coerce_text(value)
     return str(obj)
 
 
@@ -245,13 +264,126 @@ def _extract_reasoning_text(item: Any) -> str:
     deduped: list[str] = []
     seen: set[str] = set()
     for chunk in chunks:
-        normalized = chunk.strip()
+        normalized = _normalize_reasoning_text(chunk)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
         deduped.append(normalized)
 
     return ' | '.join(deduped)
+
+
+def _extract_content_text_repr(text: str) -> str:
+    marker = 'Content(text='
+    start = text.find(marker)
+    if start < 0:
+        return ''
+
+    idx = start + len(marker)
+    if idx >= len(text):
+        return ''
+    quote = text[idx]
+    if quote not in ("'", '"'):
+        return ''
+    idx += 1
+    out_chars: list[str] = []
+    escaped = False
+    while idx < len(text):
+        ch = text[idx]
+        if escaped:
+            if ch == 'n':
+                out_chars.append('\n')
+            elif ch == 't':
+                out_chars.append('\t')
+            else:
+                out_chars.append(ch)
+            escaped = False
+            idx += 1
+            continue
+        if ch == '\\':
+            escaped = True
+            idx += 1
+            continue
+        if ch == quote:
+            break
+        out_chars.append(ch)
+        idx += 1
+    return ''.join(out_chars).strip()
+
+
+def _normalize_reasoning_text(text: str) -> str:
+    normalized = (text or '').replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not normalized:
+        return ''
+
+    extracted_repr = _extract_content_text_repr(normalized)
+    if extracted_repr:
+        normalized = extracted_repr
+
+    if any(token in normalized for token in ('RunItemStreamEvent(', 'ReasoningItem(', 'FunctionTool(', 'Agent(name=')):
+        return ''
+
+    normalized = re.sub(r'\n{3,}', '\n\n', normalized)
+    normalized = '\n'.join(line.strip() for line in normalized.split('\n')).strip()
+    return normalized
+
+
+def _reasoning_fingerprint(text: str) -> str:
+    normalized = _normalize_reasoning_text(text).lower()
+    if not normalized:
+        return ''
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized[:320]
+
+
+def _merge_reasoning_text(current: str, incoming: str) -> str:
+    current_clean = _normalize_reasoning_text(current)
+    incoming_clean = _normalize_reasoning_text(incoming)
+    if not incoming_clean:
+        return current_clean
+    if not current_clean:
+        return incoming_clean
+
+    if incoming_clean == current_clean:
+        return current_clean
+    if incoming_clean.startswith(current_clean):
+        return incoming_clean
+    if current_clean.startswith(incoming_clean):
+        return current_clean
+    if incoming_clean in current_clean:
+        return current_clean
+    if current_clean in incoming_clean:
+        return incoming_clean
+
+    if current_clean.endswith(incoming_clean):
+        return current_clean
+    if incoming_clean.endswith(current_clean):
+        return incoming_clean
+
+    return f'{current_clean}\n\n{incoming_clean}'
+
+
+def _extract_reasoning_delta_from_event(event: Any) -> str:
+    event_name = str(_get_attr_or_key(event, 'name', '') or '').lower()
+    event_type = str(_get_attr_or_key(event, 'type', '') or '').lower()
+    if 'reason' not in event_name and 'reason' not in event_type:
+        return ''
+
+    candidates = [
+        _get_attr_or_key(event, 'delta', None),
+        _get_attr_or_key(event, 'item', None),
+        _get_attr_or_key(event, 'data', None),
+        _get_attr_or_key(event, 'raw_item', None),
+        event,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = _extract_reasoning_text(candidate)
+        text = _normalize_reasoning_text(text)
+        if text:
+            return text
+    return ''
 
 
 def _truncate_text(text: str, limit: int) -> str:
@@ -740,6 +872,8 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
     reasoning_log: list[str] = []
     reasoning_messages: list[str] = []
     observed_tool_calls: list[str] = []
+    stream_event_log: list[str] = []
+    live_reasoning_current = ''
     warnings: list[str] = []
     phase = 'initialising'
 
@@ -754,13 +888,33 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
             del tool_log[0 : len(tool_log) - 120]
 
     def _push_reasoning_log(entry: str) -> None:
-        reasoning_log.append(entry)
+        cleaned = _normalize_reasoning_text(entry)
+        if not cleaned:
+            return
+        fingerprint = _reasoning_fingerprint(cleaned)
+        recent_fingerprints = {_reasoning_fingerprint(line) for line in reasoning_log[-6:]}
+        if fingerprint in recent_fingerprints:
+            return
+        reasoning_log.append(cleaned)
         if len(reasoning_log) > 120:
             del reasoning_log[0 : len(reasoning_log) - 120]
 
+    def _set_live_reasoning(entry: str) -> None:
+        nonlocal live_reasoning_current
+        merged = _merge_reasoning_text(live_reasoning_current, entry)
+        if not merged:
+            return
+        if _reasoning_fingerprint(merged) == _reasoning_fingerprint(live_reasoning_current):
+            return
+        live_reasoning_current = merged
+
     def _push_reasoning_message(entry: str) -> None:
-        cleaned = entry.strip()
+        cleaned = _normalize_reasoning_text(entry)
         if not cleaned:
+            return
+        fingerprint = _reasoning_fingerprint(cleaned)
+        recent_fingerprints = {_reasoning_fingerprint(line) for line in reasoning_messages[-10:]}
+        if fingerprint in recent_fingerprints:
             return
         reasoning_messages.append(cleaned)
         if len(reasoning_messages) > 200:
@@ -774,6 +928,14 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
         if len(observed_tool_calls) > 200:
             del observed_tool_calls[0 : len(observed_tool_calls) - 200]
 
+    def _push_stream_event(entry: str) -> None:
+        cleaned = entry.strip()
+        if not cleaned:
+            return
+        stream_event_log.append(cleaned)
+        if len(stream_event_log) > 200:
+            del stream_event_log[0 : len(stream_event_log) - 200]
+
     def _title() -> str:
         if phase == 'initialising':
             return 'Agentic summarizer is starting'
@@ -783,8 +945,12 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
             return 'Agentic summarizer is writing the report'
         return 'Summary'
 
+    last_stream_event_at = datetime.now()
+    stream_event_count = 0
+
     def _build_stream_preview(started_at: datetime) -> str:
         elapsed_seconds = max(0, int((datetime.now() - started_at).total_seconds()))
+        since_last_event_seconds = max(0, int((datetime.now() - last_stream_event_at).total_seconds()))
         preview_lines: list[str] = []
         if status_lines:
             preview_lines.append('**Status**')
@@ -797,6 +963,13 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
             preview_lines.append('**Live reasoning**')
             for line in reasoning_log[-5:]:
                 preview_lines.append(f'• {_truncate_text(line, 220)}')
+        elif live_reasoning_current:
+            if preview_lines:
+                preview_lines.append('')
+            preview_lines.append('**Live reasoning**')
+            for line in live_reasoning_current.split('\n')[:5]:
+                if line.strip():
+                    preview_lines.append(f'• {_truncate_text(line.strip(), 220)}')
 
         if tool_log:
             if preview_lines:
@@ -807,6 +980,10 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
 
         if preview_lines:
             preview_lines.append('')
+        if since_last_event_seconds >= 8:
+            preview_lines.append(f'Still working… no new stream event for {since_last_event_seconds}s')
+        preview_lines.append(f'Stream events observed: {stream_event_count}')
+        preview_lines.append(f'Last stream event: {since_last_event_seconds}s ago')
         preview_lines.append(f'Elapsed: {elapsed_seconds}s')
         return '\n'.join(preview_lines)
 
@@ -888,6 +1065,15 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
             name = getattr(event, 'name', '')
             item = getattr(event, 'item', None)
             print(f'Event: {event_type} / {name} / {type(item)}')
+            stream_event_count += 1
+            last_stream_event_at = datetime.now()
+            event_label = f'{event_type}:{name}' if name else str(event_type)
+            _push_stream_event(event_label)
+
+            event_reasoning_delta = _extract_reasoning_delta_from_event(event)
+            if event_reasoning_delta:
+                _set_live_reasoning(event_reasoning_delta)
+                _push_reasoning_log(live_reasoning_current)
 
             if event_type == 'run_item_stream_event':
                 if name == 'message_output_created':
@@ -912,8 +1098,9 @@ async def create_agentic_summary(interaction: discord.Interaction, summarize_pro
                 elif name == 'reasoning_item_created':
                     reasoning_text = _extract_reasoning_text(item)
                     if reasoning_text:
-                        _push_reasoning_message(reasoning_text)
-                        _push_reasoning_log(reasoning_text)
+                        _set_live_reasoning(reasoning_text)
+                        _push_reasoning_message(live_reasoning_current)
+                        _push_reasoning_log(live_reasoning_current)
                     _push_status('Reasoning step recorded.')
                 else:
                     _push_tool_log(f'{event_type}:{name}')
