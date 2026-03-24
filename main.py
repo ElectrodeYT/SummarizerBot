@@ -48,10 +48,13 @@ def _validate_count_msgs(count_msgs: int | None) -> int | None:
 
 
 class DiscordClient(discord.Client):
+    async def setup_hook(self) -> None:
+        # Sync global application commands once at startup.
+        await self.tree.sync()
+
     async def on_ready(self):
         assert self.user is not None
         print(f"Logged in as {self.user.name} (ID: {self.user.id})")
-        await self.tree.sync()
 
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -63,6 +66,8 @@ class DiscordClient(discord.Client):
             return
 
         print(f"Setting up hook for {guild.name} (ID: {guild.id})")
+        # Ensure guild-level command sync is idempotent across process restarts.
+        self.tree.clear_commands(guild=guild)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
 
@@ -193,7 +198,7 @@ async def agentic_summarize(interaction: discord.Interaction, count_msgs: int | 
         footer_text = f'Agentic summary | Summary prompt: {summarize_prompt}'
 
         await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
-        await create_agentic_summary(interaction, summarize_prompt, footer_text, source_channel=channel)
+        await create_agentic_summary(interaction, summarize_prompt, footer_text, source_channel=channel, count_msgs=count_msgs)
     except Exception as e:
         await interaction.edit_original_response(content=f'Caught exception: {e}')
         raise
