@@ -15,4 +15,8 @@ ai_client = AsyncOpenAI(
 )
 
 SUMMARIZER_MODEL = os.environ.get('SUMMARIZER_MODEL', 'google/gemini-2.5-flash-lite-preview-09-2025')
+AGENTIC_SUMMARIZER_MODEL = os.environ.get('AGENTIC_SUMMARIZER_MODEL', 'google/gemini-2.5-flash-lite-preview-09-2025')
+AGENTIC_GUARDRAIL_MODEL = os.environ.get('AGENTIC_GUARDRAIL_MODEL', 'openai/gpt-5-nano')
 EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-3-small')
+UWUIFY_MODEL = os.environ.get('UWUIFY_MODEL', 'llama-3.3-70b-instruct')
+ZOOMER_TRANSLATOR_MODEL = os.environ.get('ZOOMER_TRANSLATOR_MODEL', 'deepseek-r1-distill-llama-70b')

@@ -145,6 +145,25 @@ async def fetch_and_cache_embeddings(messages: list, model: str):
 
 
 async def run_embeddings(interaction: 'discord.Interaction', base_sentence: str, messages: list):
-    # This function was ported but uses ai_client and EMBEDDING_MODEL from config
+    """Best-effort embedding prefetch used by topic summaries.
+
+    The caller currently ignores the return value, so this function primarily
+    exists to warm the embedding cache and avoid a broken function reference.
+    """
     model = EMBEDDING_MODEL
-    return await globals().get('run_embeddings_impl', None)(interaction, base_sentence, messages)
+    if not messages:
+        return []
+
+    try:
+        response = await ai_client.embeddings.create(input=messages, model=model)
+    except Exception:
+        return []
+
+    cached_embeddings = []
+    for message_text, item in zip(messages, response.data):
+        try:
+            await commit_embedding_to_cache(message_text, item.embedding, model)
+            cached_embeddings.append(item.embedding)
+        except Exception:
+            continue
+    return cached_embeddings

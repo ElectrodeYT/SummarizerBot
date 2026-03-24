@@ -19,7 +19,6 @@ setup(
     long_description_content_type='text/markdown',
     author='ElectrodeYT',
     packages=find_packages(exclude=('tests', 'docs')),
-    py_modules=['main', 'cache', 'summary_llm'],
     include_package_data=True,
     install_requires=install_requires,
     entry_points={

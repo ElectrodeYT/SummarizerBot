@@ -9,12 +9,13 @@ from pprint import pprint
 
 os.makedirs('data', exist_ok=True)
 
-db_con = sqlite3.connect('data/cache.db')
+db_con = sqlite3.connect('data/cache.db', check_same_thread=False)
 # Improve concurrency and read performance
 try:
     db_con.execute('PRAGMA journal_mode = WAL')
     db_con.execute('PRAGMA synchronous = NORMAL')
     db_con.execute('PRAGMA temp_store = MEMORY')
+    db_con.execute('PRAGMA busy_timeout = 5000')
 except Exception:
     pass
 

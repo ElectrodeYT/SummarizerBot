@@ -1,6 +1,6 @@
 import os
-from openai import AsyncOpenAI
 from pprint import pprint
+from typing import Any, cast
 
 import discord
 from discord import app_commands
@@ -8,30 +8,55 @@ import time
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from summarizer.llm import create_summary, create_topic_summary
+from summarizer.agentic.agentic_llm import create_agentic_summary
 from summarizer.embeddings import create_search_embeddings
 import summarizer.cache as cache
-from summarizer.cache import add_ignored_user, remove_ignored_user, list_ignored_users
+from summarizer.cache import add_ignored_user, remove_ignored_user
+from summarizer.config import ai_client, UWUIFY_MODEL, ZOOMER_TRANSLATOR_MODEL
 
-discord_token = os.environ['DISCORD_TOKEN']
+discord_token = os.environ.get('DISCORD_TOKEN')
+if not discord_token:
+    raise RuntimeError('Missing DISCORD_TOKEN environment variable')
 default_summary_prompt = 'Summarize the conversation(s). If there are several conversations, summarize them individually.'
 
-OPENAPI_TOKEN = os.environ['OPENAI_API_KEY']
 
-ai_client = AsyncOpenAI(
-    base_url=os.environ.get('OPENAI_API_BASE'),
-    api_key=OPENAPI_TOKEN
-)
+def _is_invoker_admin(interaction: discord.Interaction) -> bool:
+    guild = getattr(interaction, 'guild', None)
+    if guild is None:
+        return False
+    try:
+        member = guild.get_member(interaction.user.id)
+    except Exception:
+        member = None
+    if member is None:
+        return False
+    try:
+        if getattr(guild, 'owner_id', None) == member.id:
+            return True
+        perms = getattr(member, 'guild_permissions', None)
+        if perms is not None and (perms.administrator or perms.manage_guild):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _validate_count_msgs(count_msgs: int | None) -> int | None:
+    if count_msgs is not None and count_msgs < 0:
+        raise ValueError('count_msgs must be non-negative')
+    return count_msgs
 
 
 class DiscordClient(discord.Client):
     async def on_ready(self):
+        assert self.user is not None
         print(f"Logged in as {self.user.name} (ID: {self.user.id})")
         await self.tree.sync()
 
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.setup_guilds = []
+        self.setup_guilds: list[int] = []
 
     async def setup_guild_stuff(self, guild: discord.Guild):
         if guild.id in self.setup_guilds:
@@ -52,7 +77,7 @@ class DiscordClient(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         # Ignore messages without a channel (safety) or from webhooks
         try:
-            if message.channel is None:
+            if getattr(message, 'channel', None) is None:
                 return
         except Exception:
             return
@@ -76,7 +101,7 @@ class DiscordClient(discord.Client):
             # swallow exceptions to avoid disrupting bot runtime
             return
 
-    async def on_raw_message_delete(self, payload) -> None:
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         # Handle deletions where only the message ID is available (e.g., messages older than cache or partial state).
         try:
             # payload has attribute message_id
@@ -88,7 +113,7 @@ class DiscordClient(discord.Client):
             # best-effort: don't let exceptions propagate
             return
 
-    async def on_raw_bulk_message_delete(self, payload) -> None:
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         # Best-effort: handle raw bulk delete events where only message IDs are provided
         try:
             msg_ids = getattr(payload, 'message_ids', None)
@@ -110,7 +135,7 @@ client = DiscordClient(intents=intents)
 
 
 @client.tree.command()
-async def summarize(interaction: discord.Interaction, count_msgs: int | None = None, channel: discord.TextChannel = None,
+async def summarize(interaction: discord.Interaction, count_msgs: int | None = None, channel: discord.TextChannel | None = None,
                     summarize_prompt: str = default_summary_prompt) -> None:
     """
     Summarize messages in a channel.
@@ -125,8 +150,12 @@ async def summarize(interaction: discord.Interaction, count_msgs: int | None = N
     await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        _validate_count_msgs(count_msgs)
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         await interaction.edit_original_response(
             content='Doing stuff, might take a (long) while... (compiling messages)')
@@ -145,35 +174,40 @@ async def summarize(interaction: discord.Interaction, count_msgs: int | None = N
         raise
 
 
+@client.tree.command()
+async def agentic_summarize(interaction: discord.Interaction, count_msgs: int | None = None, channel: discord.TextChannel | None = None,
+                            summarize_prompt: str = default_summary_prompt) -> None:
+    """
+    Run the agentic summarizer over messages in a channel.
+    """
+    await interaction.response.send_message('Doing stuff, might take a (long) while...')
+
+    try:
+        _validate_count_msgs(count_msgs)
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
+
+        footer_text = f'Agentic summary | Summary prompt: {summarize_prompt}'
+
+        await interaction.edit_original_response(content='Doing stuff, might take a (long) while... (Firing up AI)')
+        await create_agentic_summary(interaction, summarize_prompt, footer_text, source_channel=channel)
+    except Exception as e:
+        await interaction.edit_original_response(content=f'Caught exception: {e}')
+        raise
+
+
 @client.tree.command(description='Add a user to the ignore list for this guild')
 async def ignore_user(interaction: discord.Interaction, user: discord.User) -> None:
     await interaction.response.send_message('Updating ignore list...', ephemeral=True)
     try:
         # Only allow adding other users if the invoking user is a server admin. Users may ignore themselves.
-        def _is_invoker_admin():
-            guild = getattr(interaction, 'guild', None)
-            if guild is None:
-                return False
-            try:
-                member = guild.get_member(interaction.user.id)
-            except Exception:
-                member = None
-            if member is None:
-                return False
-            try:
-                if getattr(guild, 'owner_id', None) == member.id:
-                    return True
-                perms = getattr(member, 'guild_permissions', None)
-                if perms is not None and (perms.administrator or perms.manage_guild):
-                    return True
-            except Exception:
-                pass
-            return False
-
         guild = getattr(interaction, 'guild', None)
         guild_id = getattr(guild, 'id', None)
         # If target is not the invoker, enforce admin-only
-        if user.id != interaction.user.id and not _is_invoker_admin():
+        if user.id != interaction.user.id and not _is_invoker_admin(interaction):
             await interaction.edit_original_response(content="You don't have permission to ignore other users; you may only ignore yourself.")
             return
 
@@ -189,29 +223,9 @@ async def unignore_user(interaction: discord.Interaction, user: discord.User) ->
     await interaction.response.send_message('Updating ignore list...', ephemeral=True)
     try:
         # Only allow removing other users if the invoking user is a server admin. Users may unignore themselves.
-        def _is_invoker_admin():
-            guild = getattr(interaction, 'guild', None)
-            if guild is None:
-                return False
-            try:
-                member = guild.get_member(interaction.user.id)
-            except Exception:
-                member = None
-            if member is None:
-                return False
-            try:
-                if getattr(guild, 'owner_id', None) == member.id:
-                    return True
-                perms = getattr(member, 'guild_permissions', None)
-                if perms is not None and (perms.administrator or perms.manage_guild):
-                    return True
-            except Exception:
-                pass
-            return False
-
         guild = getattr(interaction, 'guild', None)
         guild_id = getattr(guild, 'id', None)
-        if user.id != interaction.user.id and not _is_invoker_admin():
+        if user.id != interaction.user.id and not _is_invoker_admin(interaction):
             await interaction.edit_original_response(content="You don't have permission to unignore other users; you may only unignore yourself.")
             return
 
@@ -233,34 +247,15 @@ async def list_ignored(interaction: discord.Interaction) -> None:
         guild = getattr(interaction, 'guild', None)
         guild_id = getattr(guild, 'id', None)
 
-        def _is_invoker_admin():
-            if guild is None:
-                return False
-            try:
-                member = guild.get_member(interaction.user.id)
-            except Exception:
-                member = None
-            if member is None:
-                return False
-            try:
-                if getattr(guild, 'owner_id', None) == member.id:
-                    return True
-                perms = getattr(member, 'guild_permissions', None)
-                if perms is not None and (perms.administrator or perms.manage_guild):
-                    return True
-            except Exception:
-                pass
-            return False
-
-        if not _is_invoker_admin():
+        if not _is_invoker_admin(interaction):
             await interaction.edit_original_response(content="You don't have permission to view the server's ignore list.")
             return
 
-        rows = await cache.list_ignored_users(guild_id)
+        rows = cast(list[dict[str, Any]], await cache.list_ignored_users(guild_id))
         if not rows:
             await interaction.edit_original_response(content='No ignored users for this server.')
             return
-        lines = []
+        lines: list[str] = []
         for r in rows:
             g = r.get('guild_id')
             scope = 'Global' if g is None else 'Server'
@@ -274,13 +269,17 @@ async def list_ignored(interaction: discord.Interaction) -> None:
 
 @client.tree.command(description='Summarize for topic')
 async def summarize_topic(interaction: discord.Interaction, topic: str, count_msgs: int | None = None,
-                          channel: discord.TextChannel = None) -> None:
+                          channel: discord.TextChannel | None = None) -> None:
     # If count_msgs is omitted, summarize all cached messages for the channel by default.
     await interaction.response.send_message('Doing stuff, might take a (long) while...')
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        _validate_count_msgs(count_msgs)
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         await interaction.edit_original_response(
             content='Doing stuff, might take a (long) while... (compiling messages)')
@@ -302,17 +301,22 @@ async def summarize_topic(interaction: discord.Interaction, topic: str, count_ms
 
 @client.tree.command(description='Pre-fetch older messages and reconcile channel links in the DB')
 async def reconcile_messages(interaction: discord.Interaction, count_msgs: int = 1000,
-                             channel: discord.TextChannel = None) -> None:
+                             channel: discord.TextChannel | None = None) -> None:
     await interaction.response.send_message('Starting reconciliation, this may take a while...', ephemeral=True)
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        if count_msgs < 0:
+            raise ValueError('count_msgs must be non-negative')
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         # We'll update the original response periodically to show progress
         last_reported = {'processed': 0}
 
-        async def progress_cb(processed, total, type="Fetched"):
+        async def progress_cb(processed: int, total: int, type: str = "Fetched"):
             # Only edit when notable progress is made
             if processed - last_reported['processed'] >= 25:
                 try:
@@ -330,16 +334,19 @@ async def reconcile_messages(interaction: discord.Interaction, count_msgs: int =
 
 
 @client.tree.command(description='Fill gaps between earliest and latest cached messages for a channel')
-async def reconcile_gaps(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
+async def reconcile_gaps(interaction: discord.Interaction, channel: discord.TextChannel | None = None) -> None:
     await interaction.response.send_message('Starting gap reconciliation, this may take a while...', ephemeral=True)
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         last_reported = {'processed': 0}
 
-        async def progress_cb(processed, total, type='fetched_gap'):
+        async def progress_cb(processed: int, total: int, type: str = 'fetched_gap'):
             # Update periodically
             if processed - last_reported['processed'] >= 50:
                 try:
@@ -357,12 +364,15 @@ async def reconcile_gaps(interaction: discord.Interaction, channel: discord.Text
 
 
 @client.tree.command(description='Show cache status for a channel')
-async def cache_status(interaction: discord.Interaction, channel: discord.TextChannel = None) -> None:
+async def cache_status(interaction: discord.Interaction, channel: discord.TextChannel | None = None) -> None:
     await interaction.response.send_message('Fetching cache status...', ephemeral=True)
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         stats = await cache.get_channel_cache_stats(channel)
 
@@ -385,13 +395,16 @@ async def cache_status(interaction: discord.Interaction, channel: discord.TextCh
 
 
 @client.tree.command(description='Search cached messages using embeddings (does NOT hit Discord API)')
-async def search_cache(interaction: discord.Interaction, query: str, channel: discord.TextChannel = None,
+async def search_cache(interaction: discord.Interaction, query: str, channel: discord.TextChannel | None = None,
                        top_k: int = 5) -> None:
     await interaction.response.send_message('Searching cache...', ephemeral=True)
 
     try:
-        if channel is None:
-            channel = interaction.channel
+        resolved_channel = channel if channel is not None else interaction.channel
+        if not isinstance(resolved_channel, discord.TextChannel):
+            await interaction.edit_original_response(content='This command requires a text channel.')
+            return
+        channel = resolved_channel
 
         model = 'bge-multilingual-gemma2'
 
@@ -523,7 +536,7 @@ async def search_cache(interaction: discord.Interaction, query: str, channel: di
 async def uwuify_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
     await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)
 
-    model = 'llama-3.3-70b-instruct'
+    model = UWUIFY_MODEL
     temperature = 1.26
     top_p = 0.81
     max_tokens = 4096
@@ -571,7 +584,7 @@ async def uwuify_ephemeral(interaction: discord.Interaction, message: discord.Me
 async def zoomer_translator_impl(interaction: discord.Interaction, message: discord.Message, ephemeral: bool):
     await interaction.response.send_message('Doing stuff, might take a while...', ephemeral=ephemeral)
 
-    model = 'deepseek-r1-distill-llama-70b'
+    model = ZOOMER_TRANSLATOR_MODEL
     temperature = 0.70
     top_p = 0.95
     max_tokens = 4096
