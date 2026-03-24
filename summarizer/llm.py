@@ -34,7 +34,7 @@ async def run_llm(interaction: discord.Interaction, llm_messages: list, embed: d
     completion = await ai_client.chat.completions.create(
         model=model,
         messages=llm_messages,
-        temperature=temperature,
+        # temperature=temperature,
         max_tokens=max_tokens,
         stream=True,
         reasoning_effort="medium"
